@@ -125,8 +125,13 @@ Left-click the tray icon, right-click the tray icon and choose **Open Control Pa
 - **Connected Displays:** Inspect active, off, and temporarily unplugged displays on the interactive 2D layout map. Select any monitor tile on the map or **Turn Off** on a monitor card to deactivate a single display, or select **Restore All** to wake displays to the saved snapshot.
 - **Quick layout actions:** Use **Toggle Externals**, **Sleep All**, **Capture Snapshot**, **Wake All**, or **Force Recover** in the header and display toolbar.
 - **Monitor Configurations & Shortcuts:** Create unlimited profiles selecting **Include (ON)**, **Exclude (OFF)**, or **Auto** per monitor, with optional global shortcuts or blank shortcuts for tray-only toggling.
-- **Global Shortcuts, Recovery & Appearance:** Press **Record** beside any shortcut box to capture a keybind (`Esc` cancels recording), adjust recovery timeouts and toggles, manage **Desktop & Start Menu Launcher (`CtrlDark.exe`)** shortcuts, or switch between **System**, **Light**, and **Dark** themes immediately.
+- **Global Shortcuts, Recovery & Appearance:** Press **Record** beside any shortcut box to capture a keybind (`Esc` cancels recording), adjust recovery timeouts and independent session lock/unlock toggles, manage **Desktop & Start Menu Launcher (`CtrlDark.exe`)** shortcuts, or switch between **System**, **Light**, and **Dark** themes immediately.
 - **Draft safety:** Refreshing polls do not overwrite unsaved form edits. Select **Discard changes** to reload saved values, or **Save settings** to validate and apply changes.
+
+<p align="center">
+  <img src="assets/screenshots/control-panel-dark.png" alt="Ctrl + Dark Control Panel in Dark theme showing Selective Off with two active displays, custom profiles, and session lock/unlock checkboxes" width="760"><br>
+  <em>Dark Control Panel showing Selective Off (2/4 displays active), custom profiles, and session lock/unlock toggles.</em>
+</p>
 
 > [!NOTE]
 > **Worked example: Creating a custom two-monitor focus profile**
@@ -137,6 +142,16 @@ Left-click the tray icon, right-click the tray icon and choose **Open Control Pa
 > 4. Mark your two desk monitors as **Include (ON)** (leaving other displays on **Auto** so they turn off), verify the live **Stays ON** / **Turns OFF** preview, and select **Test Layout Now** if you want to preview before saving.
 > 5. Select **Save configuration**.
 >    **Result:** Ctrl + Dark binds `Ctrl+Alt+2` immediately and adds **Desk Focus** to the system tray menu with an active checkmark whenever that layout is engaged.
+
+<p align="center">
+  <img src="assets/screenshots/config-builder-dark.png" alt="Ctrl + Dark New Monitor Configuration dialog with Include and Exclude display toggles and live outcome pills" width="660"><br>
+  <em>Configuration Builder dialog with live Stays ON and Turns OFF outcome previews.</em>
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/control-panel-light.png" alt="Ctrl + Dark Control Panel in Light theme showing all four active displays" width="760"><br>
+  <em>Light theme Control Panel showing all four displays active.</em>
+</p>
 
 ### System tray & physical monitor power buttons
 
@@ -157,6 +172,15 @@ Select the full-sleep mode in the Control Panel under **Full-sleep wake behavior
 |---|---|
 | `hotkey_only` **(recommended)** | Blocks accidental mouse bumps, desk vibrations, and stray keypresses from waking sleeping monitors. Press your toggle/recover hotkey or press `Esc` three times within `2 s` to unlock. |
 | `any_input` | Standard Windows DPMS monitor sleep. Useful when you want any mouse move or keypress to wake and recover displays automatically. |
+
+### Locking and unlocking Windows
+
+Configure Windows lock and unlock automation as two independent options in the Control Panel, the system tray right-click menu, or `config.toml`:
+
+- **Lock computer when turning off all monitors** (`lock_workstation_on_sleep`): Calls Windows `LockWorkStation` before sleeping all displays. Input locking (`hotkey_only`) stands down during session lock so the Windows sign-in screen accepts your password or PIN.
+- **Turn monitors back on when unlocking Windows** (`wake_on_session_unlock`): Subscribes to Windows session unlock notifications (`WTS_SESSION_UNLOCK`) and wakes monitors with full topology recovery when you unlock your session. While locked, display wake suppression stays active so background screen flashes on the lock screen do not trigger premature recovery.
+
+Both toggles act independently. Enable either option alone or together from **Startup & display recovery options** or the tray items **Lock Computer When Turning Off Monitors** and **Turn Monitors On When Unlocking**.
 
 ### Local-only IPC and Control Panel isolation
 
@@ -190,6 +214,8 @@ All persistent settings live in `%APPDATA%\monitor-toggle\config.toml`. You can 
 |---|---|---|---|
 | `start_minimized_to_tray` | Hides the Control Panel window when launching `CtrlDark.exe` cold | `true` | Pass `CtrlDark.exe --open` to force the window open. |
 | `wake_mode` | Controls input locking while all monitors sleep | `"hotkey_only"` | Alternatives: `"any_input"`. `Esc` × 3 unlocks `hotkey_only`. |
+| `lock_workstation_on_sleep` | Locks Windows (`LockWorkStation`) before sleeping all monitors | `false` | Independent of `wake_on_session_unlock`. Temporarily skips `hotkey_only` input lock on the sign-in screen. |
+| `wake_on_session_unlock` | Wakes displays and runs recovery on `WTS_SESSION_UNLOCK` | `false` | Independent of `lock_workstation_on_sleep`. Skips resetting intentional `SelectiveOff` layouts. |
 | `hotkeys.toggle_all` | Global hotkey to toggle all displays off/on | `"Ctrl+Alt+M"` | Set `""` to disable the global hotkey. |
 | `hotkeys.toggle_externals` | Global hotkey to toggle external/USB displays only | `"Ctrl+Alt+E"` | Keeps the internal panel ON. |
 | `hotkeys.force_recover` | Blind force-recover and external path bounce hotkey | `"Ctrl+Alt+Shift+M"` | Works even when monitors stay black. |
@@ -214,6 +240,10 @@ start_minimized_to_tray = true
 #   "hotkey_only" - Ignore mouse bumps & stray keys while toggled off (press Esc 3x as failsafe)
 #   "any_input"   - Normal DPMS sleep (any mouse/key or hotkey wakes & recovers displays)
 wake_mode = "hotkey_only"
+# Lock Windows (Win+L equivalent) immediately before putting all monitors to sleep
+lock_workstation_on_sleep = false
+# Wake monitors and run display recovery automatically when unlocking Windows
+wake_on_session_unlock = false
 
 [hotkeys]
 # Global toggle for all monitors
@@ -333,6 +363,7 @@ All artwork under [assets/](assets/) is documented in [assets/README.md](assets/
 | **Application Icon** | Embedded Win32 `.exe`, window, taskbar & `.lnk` icon (`16–256 px`) | [assets/icons/CtrlDark.ico](assets/icons/CtrlDark.ico) |
 | **Tray Icons** | Dark-taskbar (`dark-active.ico`) & light-taskbar (`light-active.ico`) notification area icons | [assets/tray/](assets/tray/) |
 | **Vector Master** | Source mascot SVG served at `/mascot.svg` | [assets/source/mascot-master.svg](assets/source/mascot-master.svg) |
+| **UI Screenshots** | High-DPI Control Panel dark, modal builder, and light overview captures | [assets/screenshots/](assets/screenshots/) |
 
 ### Validation commands
 

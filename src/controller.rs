@@ -43,6 +43,22 @@ use crate::window_restore::{capture_windows, SavedWindow};
 pub const WM_APP_WORKER_DONE: u32 = WM_APP + 20;
 pub const WM_APP_IPC_ACTION: u32 = WM_APP + 21;
 pub const WM_APP_EXIT: u32 = WM_APP + 22;
+pub const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+
+const WTS_SESSION_LOCK: usize = 0x7;
+const WTS_SESSION_UNLOCK: usize = 0x8;
+const NOTIFY_FOR_THIS_SESSION: u32 = 0;
+
+#[link(name = "user32")]
+extern "system" {
+    fn LockWorkStation() -> i32;
+}
+
+#[link(name = "wtsapi32")]
+extern "system" {
+    fn WTSRegisterSessionNotification(hwnd: HWND, flags: u32) -> i32;
+    fn WTSUnRegisterSessionNotification(hwnd: HWND) -> i32;
+}
 
 pub const TIMER_HPD_SETTLE: usize = 1;
 const DBT_DEVNODES_CHANGED: usize = 0x0007;
@@ -95,6 +111,7 @@ enum WorkerJob {
     SleepAll {
         trigger_vk: Option<u16>,
         wake_mode: WakeMode,
+        lock_workstation: bool,
     },
     DeactivateSelective {
         target_keys: Vec<String>,
@@ -160,6 +177,8 @@ pub struct Controller {
     last_hpd_diff: String,
     last_reenforce_at: Option<Instant>,
     reenforce_attempts_for_hpd: u32,
+    wts_registered: bool,
+    session_locked: bool,
     pub tray: Option<TrayManager>,
     pub tray_displays: Vec<DisplayInfo>,
     worker_tx: Sender<WorkerJob>,
@@ -187,6 +206,13 @@ impl Controller {
                 DEVICE_NOTIFY_WINDOW_HANDLE,
             )
         };
+        let wts_registered =
+            unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } != 0;
+        if !wts_registered {
+            logging::warn(
+                "WTSRegisterSessionNotification failed; unlock wake detection unavailable",
+            );
+        }
 
         let mut snapshot = load_snapshot(&config::snapshot_path()).unwrap_or(None);
         let displays = query_displays(true).unwrap_or_default();
@@ -235,6 +261,8 @@ impl Controller {
             last_hpd_diff: String::new(),
             last_reenforce_at: None,
             reenforce_attempts_for_hpd: 0,
+            wts_registered,
+            session_locked: false,
             tray: Some(tray),
             tray_displays: displays,
             worker_tx: job_tx,
@@ -446,7 +474,13 @@ impl Controller {
 
         match scope {
             TargetScope::All => {
-                let wake_mode = wake_override.unwrap_or(self.config.wake_mode);
+                let lock_workstation = self.config.lock_workstation_on_sleep;
+                // Locking switches to Secure Desktop where low-level input hooks cannot run cleanly.
+                let wake_mode = if lock_workstation {
+                    WakeMode::AnyInput
+                } else {
+                    wake_override.unwrap_or(self.config.wake_mode)
+                };
                 if wake_mode == WakeMode::HotkeyOnly {
                     self.arm_input_guard();
                 } else {
@@ -466,6 +500,7 @@ impl Controller {
                 let _ = self.worker_tx.send(WorkerJob::SleepAll {
                     trigger_vk,
                     wake_mode,
+                    lock_workstation,
                 });
             }
             TargetScope::ExternalsOnly
@@ -685,7 +720,10 @@ impl Controller {
     pub fn on_power_broadcast(&mut self, wparam: WPARAM, lparam: LPARAM) {
         let evt = wparam as u32;
         if evt == PBT_APMRESUMEAUTOMATIC {
-            if self.config.recovery.recover_on_system_wake && self.phase != DaemonPhase::LockedOff {
+            if self.config.recovery.recover_on_system_wake
+                && self.phase != DaemonPhase::LockedOff
+                && !self.session_locked
+            {
                 logging::info("System resume detected; verifying display recovery");
                 self.trigger_recover(false);
             }
@@ -723,16 +761,37 @@ impl Controller {
                             );
                             send_monitors_off_power(Some(self.hwnd));
                         }
-                    } else if self.phase == DaemonPhase::SleepingNormal
-                        || (self.phase == DaemonPhase::ActiveOn
-                            && self.config.recovery.recover_on_system_wake
-                            && off_duration >= Duration::from_secs(2))
+                    } else if !self.session_locked
+                        && (self.phase == DaemonPhase::SleepingNormal
+                            || (self.phase == DaemonPhase::ActiveOn
+                                && self.config.recovery.recover_on_system_wake
+                                && off_duration >= Duration::from_secs(2)))
                     {
                         logging::info("Display wake detected; running anti-black-screen recovery");
                         self.trigger_recover(false);
                     }
                 }
             }
+        }
+    }
+
+    pub fn on_session_change(&mut self, wparam: WPARAM) {
+        match wparam {
+            WTS_SESSION_LOCK => {
+                self.session_locked = true;
+                logging::info("Windows session locked");
+            }
+            WTS_SESSION_UNLOCK => {
+                self.session_locked = false;
+                logging::info("Windows session unlocked");
+                if should_wake_on_session_unlock(self.config.wake_on_session_unlock, &self.phase) {
+                    logging::info(
+                        "Session unlock wake enabled; waking monitors and running recovery",
+                    );
+                    self.trigger_on();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -901,6 +960,20 @@ impl Controller {
                 self.config.start_minimized_to_tray = !self.config.start_minimized_to_tray;
                 if let Err(e) = self.config.save() {
                     logging::warn(format!("Failed saving start_minimized_to_tray: {e}"));
+                }
+                self.update_tray_visual();
+            }
+            crate::tray::MENU_TOGGLE_LOCK_ON_SLEEP => {
+                self.config.lock_workstation_on_sleep = !self.config.lock_workstation_on_sleep;
+                if let Err(e) = self.config.save() {
+                    logging::warn(format!("Failed saving lock_workstation_on_sleep: {e}"));
+                }
+                self.update_tray_visual();
+            }
+            crate::tray::MENU_TOGGLE_WAKE_ON_UNLOCK => {
+                self.config.wake_on_session_unlock = !self.config.wake_on_session_unlock;
+                if let Err(e) = self.config.save() {
+                    logging::warn(format!("Failed saving wake_on_session_unlock: {e}"));
                 }
                 self.update_tray_visual();
             }
@@ -1102,6 +1175,8 @@ impl Controller {
             wake_mode: self.config.wake_mode,
             autostart_on,
             start_minimized_to_tray: self.config.start_minimized_to_tray,
+            lock_workstation_on_sleep: self.config.lock_workstation_on_sleep,
+            wake_on_session_unlock: self.config.wake_on_session_unlock,
             toggle_all_hk: self.config.hotkeys.toggle_all.clone(),
             toggle_ext_hk: self.config.hotkeys.toggle_externals.clone(),
             recover_hk: self.config.hotkeys.force_recover.clone(),
@@ -1138,6 +1213,12 @@ impl Controller {
                 UnregisterPowerSettingNotification(self.power_notify);
             }
             self.power_notify = 0;
+        }
+        if self.wts_registered {
+            unsafe {
+                WTSUnRegisterSessionNotification(self.hwnd as HWND);
+            }
+            self.wts_registered = false;
         }
         self.tray.take();
         unsafe {
@@ -1611,14 +1692,29 @@ fn reconcile_disabled_keys(
     reconciled
 }
 
+fn should_wake_on_session_unlock(wake_on_unlock: bool, phase: &DaemonPhase) -> bool {
+    wake_on_unlock && !matches!(phase, DaemonPhase::SelectiveOff | DaemonPhase::Recovering)
+}
+
 fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult>) {
     while let Ok(job) = rx.recv() {
         let result = match job {
             WorkerJob::SleepAll {
                 trigger_vk,
                 wake_mode,
+                lock_workstation,
             } => {
                 hotkey::wait_for_keys_released(trigger_vk, 800, 80);
+                if lock_workstation {
+                    let locked = unsafe { LockWorkStation() } != 0;
+                    if locked {
+                        logging::info("Locked workstation prior to monitor sleep");
+                    } else {
+                        logging::warn("LockWorkStation failed before monitor sleep");
+                    }
+                    // Give Winlogon time to switch to Secure Desktop before powering off displays.
+                    thread::sleep(Duration::from_millis(250));
+                }
                 send_monitors_off_power(Some(hwnd_raw));
                 WorkerResult::SleepAllArmed { wake_mode }
             }
@@ -2168,5 +2264,37 @@ mod tests {
             reconcile_disabled_keys(&intended, &reactivated_live),
             vec!["display#aus1641#3".to_string()]
         );
+    }
+
+    #[test]
+    fn session_unlock_wake_decision_respects_flag_and_phase() {
+        assert!(!should_wake_on_session_unlock(
+            false,
+            &DaemonPhase::SleepingNormal
+        ));
+        assert!(!should_wake_on_session_unlock(
+            false,
+            &DaemonPhase::ActiveOn
+        ));
+
+        assert!(should_wake_on_session_unlock(
+            true,
+            &DaemonPhase::SleepingNormal
+        ));
+        assert!(should_wake_on_session_unlock(true, &DaemonPhase::LockedOff));
+        assert!(should_wake_on_session_unlock(true, &DaemonPhase::ActiveOn));
+        assert!(should_wake_on_session_unlock(
+            true,
+            &DaemonPhase::RecoveryFailed
+        ));
+
+        assert!(!should_wake_on_session_unlock(
+            true,
+            &DaemonPhase::SelectiveOff
+        ));
+        assert!(!should_wake_on_session_unlock(
+            true,
+            &DaemonPhase::Recovering
+        ));
     }
 }

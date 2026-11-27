@@ -37,6 +37,8 @@
     if (!settingsDirty || !settingsBase || !prevConfig || !updatedConfig) return;
     const sameGlobal =
       prevConfig.start_minimized_to_tray === updatedConfig.start_minimized_to_tray &&
+      prevConfig.lock_workstation_on_sleep === updatedConfig.lock_workstation_on_sleep &&
+      prevConfig.wake_on_session_unlock === updatedConfig.wake_on_session_unlock &&
       prevConfig.wake_mode === updatedConfig.wake_mode &&
       prevConfig.hotkeys.toggle_all === updatedConfig.hotkeys.toggle_all &&
       prevConfig.hotkeys.toggle_externals === updatedConfig.hotkeys.toggle_externals &&
@@ -702,6 +704,8 @@
     const rec = cfg.recovery || {};
     document.getElementById('opt-autostart').checked = Boolean(appState.autostart);
     document.getElementById('opt-start-minimized').checked = cfg.start_minimized_to_tray ?? true;
+    document.getElementById('opt-lock-on-sleep').checked = Boolean(cfg.lock_workstation_on_sleep);
+    document.getElementById('opt-wake-on-unlock').checked = Boolean(cfg.wake_on_session_unlock);
     document.getElementById('opt-settle-timeout').value = String(rec.settle_timeout_ms ?? 4000);
     document.getElementById('opt-retrain-usb').checked = Boolean(rec.retrain_usb_displays_on_wake);
     document.getElementById('opt-ddc').checked = Boolean(rec.ddc_assist);
@@ -1403,6 +1407,8 @@
     const expectedConfig = settingsBase || appState.config;
     const nextCfg = structuredClone(expectedConfig);
     nextCfg.start_minimized_to_tray = document.getElementById('opt-start-minimized').checked;
+    nextCfg.lock_workstation_on_sleep = document.getElementById('opt-lock-on-sleep').checked;
+    nextCfg.wake_on_session_unlock = document.getElementById('opt-wake-on-unlock').checked;
     nextCfg.hotkeys.toggle_all = hkInputs[0].value.trim();
     nextCfg.hotkeys.toggle_externals = hkInputs[1].value.trim();
     nextCfg.hotkeys.force_recover = hkInputs[2].value.trim();

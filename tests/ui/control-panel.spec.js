@@ -15,6 +15,8 @@ function fixture() {
     status: { state: 'active_on', active_monitors: 2, total_available_monitors: 2, snapshot_monitors: 2, snapshot_captured_unix_ms: 1700000000000, hotkey_warnings: [] },
     config: {
       start_minimized_to_tray: true,
+      lock_workstation_on_sleep: false,
+      wake_on_session_unlock: false,
       wake_mode: 'hotkey_only',
       hotkeys: { toggle_all: 'Ctrl+Alt+M', toggle_externals: 'Ctrl+Alt+E', force_recover: 'Ctrl+Alt+Shift+M', monitor_hotkeys: [
         { label: 'Desk focus', hotkey: '', include: ['display#external#2'], exclude: [], action: 'toggle' },
@@ -346,6 +348,27 @@ test('start minimized setting persists and launcher shortcuts toggle cleanly', a
   await page.locator('#btn-shortcut-start-menu').click();
   await expect.poll(() => mock.actions.length).toBe(2);
   expect(mock.actions[1]).toMatchObject({ action: 'remove_shortcuts', start_menu: true, desktop: false });
+});
+
+test('lock workstation and wake on unlock options toggle independently', async ({ page }) => {
+  const mock = await setup(page);
+  const lockBox = page.locator('#opt-lock-on-sleep');
+  const wakeBox = page.locator('#opt-wake-on-unlock');
+  await expect(lockBox).not.toBeChecked();
+  await expect(wakeBox).not.toBeChecked();
+
+  await lockBox.check();
+  await page.locator('#btn-save-settings').click();
+  await expect.poll(() => mock.writes.length).toBe(1);
+  expect(mock.writes[0].config.lock_workstation_on_sleep).toBe(true);
+  expect(mock.writes[0].config.wake_on_session_unlock).toBe(false);
+
+  await lockBox.uncheck();
+  await wakeBox.check();
+  await page.locator('#btn-save-settings').click();
+  await expect.poll(() => mock.writes.length).toBe(2);
+  expect(mock.writes[1].config.lock_workstation_on_sleep).toBe(false);
+  expect(mock.writes[1].config.wake_on_session_unlock).toBe(true);
 });
 
 test('selective off topology stage renders all monitors cleanly without overlap', async ({ page }) => {

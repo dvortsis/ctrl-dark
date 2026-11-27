@@ -219,6 +219,14 @@ unsafe extern "system" fn daemon_wndproc(
             }
             1
         }
+        monitor_toggle::controller::WM_WTSSESSION_CHANGE => {
+            if let Some(ctrl_arc) = CONTROLLER.get() {
+                if let Ok(mut ctrl) = ctrl_arc.lock() {
+                    ctrl.on_session_change(wparam);
+                }
+            }
+            0
+        }
         WM_DISPLAYCHANGE => {
             if let Some(ctrl_arc) = CONTROLLER.get() {
                 if let Ok(mut ctrl) = ctrl_arc.lock() {

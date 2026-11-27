@@ -41,6 +41,8 @@ pub const MENU_OPEN_CONFIG: usize = 1007;
 pub const MENU_RELOAD_CONFIG: usize = 1008;
 pub const MENU_EXIT: usize = 1009;
 pub const MENU_TOGGLE_START_MINIMIZED: usize = 1010;
+pub const MENU_TOGGLE_LOCK_ON_SLEEP: usize = 1011;
+pub const MENU_TOGGLE_WAKE_ON_UNLOCK: usize = 1012;
 pub const MENU_MONITOR_BASE: usize = 2000;
 pub const MENU_RULE_BASE: usize = 3000;
 
@@ -50,6 +52,8 @@ pub struct TrayMenuData {
     pub wake_mode: WakeMode,
     pub autostart_on: bool,
     pub start_minimized_to_tray: bool,
+    pub lock_workstation_on_sleep: bool,
+    pub wake_on_session_unlock: bool,
     pub toggle_all_hk: String,
     pub toggle_ext_hk: String,
     pub recover_hk: String,
@@ -265,6 +269,30 @@ pub fn show_context_menu_for_hwnd(data: &TrayMenuData) {
         min_flags,
         MENU_TOGGLE_START_MINIMIZED,
         "Start Minimized to Tray",
+    );
+    let lock_flags = MF_STRING
+        | if data.lock_workstation_on_sleep {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+    append_item(
+        hmenu,
+        lock_flags,
+        MENU_TOGGLE_LOCK_ON_SLEEP,
+        "Lock Computer When Turning Off Monitors",
+    );
+    let unlock_wake_flags = MF_STRING
+        | if data.wake_on_session_unlock {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+    append_item(
+        hmenu,
+        unlock_wake_flags,
+        MENU_TOGGLE_WAKE_ON_UNLOCK,
+        "Turn Monitors On When Unlocking",
     );
 
     unsafe {

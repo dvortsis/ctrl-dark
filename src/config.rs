@@ -247,6 +247,10 @@ pub struct AppConfig {
     #[serde(default = "default_start_minimized")]
     pub start_minimized_to_tray: bool,
     pub wake_mode: WakeMode,
+    #[serde(default)]
+    pub lock_workstation_on_sleep: bool,
+    #[serde(default)]
+    pub wake_on_session_unlock: bool,
     pub hotkeys: HotkeysConfig,
     pub recovery: RecoveryConfig,
 }
@@ -256,6 +260,8 @@ impl Default for AppConfig {
         Self {
             start_minimized_to_tray: true,
             wake_mode: WakeMode::HotkeyOnly,
+            lock_workstation_on_sleep: false,
+            wake_on_session_unlock: false,
             hotkeys: HotkeysConfig::default(),
             recovery: RecoveryConfig::default(),
         }
@@ -343,6 +349,10 @@ start_minimized_to_tray = true
 #   "hotkey_only" - Ignore mouse bumps & stray keys while toggled off (press Esc 3x as failsafe)
 #   "any_input"   - Normal DPMS sleep (any mouse/key or hotkey wakes & recovers displays)
 wake_mode = "hotkey_only"
+# Lock Windows (Win+L equivalent) immediately before putting all monitors to sleep
+lock_workstation_on_sleep = false
+# Wake monitors and run display recovery automatically when unlocking Windows
+wake_on_session_unlock = false
 
 [hotkeys]
 # Global toggle for all monitors
@@ -512,5 +522,20 @@ except = ["P27h-20", "J560T09"]
         )
         .unwrap();
         assert!(!explicit.start_minimized_to_tray);
+    }
+
+    #[test]
+    fn lock_and_unlock_options_default_false_and_parse_independently() {
+        let legacy = AppConfig::from_toml_str("wake_mode = \"hotkey_only\"").unwrap();
+        assert!(!legacy.lock_workstation_on_sleep);
+        assert!(!legacy.wake_on_session_unlock);
+
+        let lock_only = AppConfig::from_toml_str("lock_workstation_on_sleep = true").unwrap();
+        assert!(lock_only.lock_workstation_on_sleep);
+        assert!(!lock_only.wake_on_session_unlock);
+
+        let unlock_only = AppConfig::from_toml_str("wake_on_session_unlock = true").unwrap();
+        assert!(!unlock_only.lock_workstation_on_sleep);
+        assert!(unlock_only.wake_on_session_unlock);
     }
 }
