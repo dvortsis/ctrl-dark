@@ -1,0 +1,21 @@
+# Third code & UX/UI audit — November 25, 2026
+
+Full-codebase code, reliability, security, and UX/UI audit across all Rust modules, Windows IPC/tray/UI hosts, and embedded Control Panel assets.
+
+## Code & Windows Integration Fixes
+
+| Module | Finding | Correction |
+| --- | --- | --- |
+| `src/tray.rs` | Single `&` stripped as mnemonic (`Only P27h-20  J560T09`), trailing `\t` on cleared hotkeys, offline displays shown clickable, and missing `WM_NULL` post after `TrackPopupMenu`. | Escape `&` as `&&`, omit empty `\t`, gray out unavailable displays (`[Offline]`, ID `0`), post `WM_NULL` (KB135788), and add unit tests. |
+| `src/controller.rs` | `worker_loop` reloaded `config.toml` from disk per job, `active_disabled` drifted on external changes, `SelectiveApplied` dropped inactive displays from `tray_displays`, and `ApplyFilteredSnapshot` skipped EDID fallback and over-reset non-USB displays. | Pass runtime `AppConfig` in `WorkerJob`, compute `disabled_keys` and `tray_displays` from live CCD queries, match `ApplyFilteredSnapshot` with exact-first + unique EDID fallback, limit `force_mode_recommit` to `UsbIndirect`, and verify kept targets became active. |
+| `src/display/ddc.rs` | `run_on_physical_monitors` dropped results for secondary physical panels sharing an `HMONITOR`. | Return all panel results; report wake success if any panel succeeds and prefer non-`0x01` sleep states in `pick_power_reading`. |
+| `src/ipc.rs` | Single-client accept loop left a brief no-pipe window between requests and `send_request_to` did not retry `ERROR_PIPE_BUSY`/`ERROR_FILE_NOT_FOUND`. | Handle connected pipe clients on bounded worker threads (`MAX_PIPE_INSTANCES = 4`) and loop `send_request_to` until `deadline` with concurrent-client tests. |
+| `src/bin/daemon.rs`, `cli.rs`, `ui.rs` | Cold-start race before `ctrl.ui_url` initialization; live `bench` could overwrite a larger baseline snapshot; `ui.rs` leaked `focus_event_raw` handle. | Bind HTTP server before starting Named Pipe IPC; preserve larger existing snapshots in `bench` and print recovery hint; join watcher thread and `CloseHandle` on `Event::LoopDestroyed`. |
+| `src/web_server.rs` | `script-src` needed `'unsafe-inline'` for theme bootstrap; repeatable headers were rejected; `toggle_monitor` queued unavailable keys and `snapshot` slept unnecessarily. | Serve `/theme.js` with `script-src 'self'`, allow repeatable headers while rejecting duplicate singleton headers, validate `toggle_monitor` keys live, and skip the `80 ms` sleep on synchronous `snapshot`. |
+| `src/config.rs`, `hotkey.rs`, `window_restore.rs` | Whitespace-only `include` blocked legacy fallback; key token canonicalization diverged from JS recorder (`PGUP` vs `PageUp`); non-maximized windows stayed maximized when repositioned. | Clean whitespace before empty check, map `canonical_key_name(vk)`, and un-maximize displaced non-maximized windows before `SetWindowPos`. |
+
+## UX/UI & Accessibility Fixes
+
+- **Screen-reader live regions & modal feedback**: Removed duplicate `aria-live` from `#status-toast` so `#live-announcer` owns page speech, and added an in-dialog `#config-status` live region so **"Test Layout Now"** reports visibly and audibly inside the modal top layer.
+- **High Contrast / Forced Colors & error resilience**: Added `@media (forced-colors: active)` button, badge, stage, focus-ring, and checked-segment styles in [src/ui/styles.css](file:///c:/src/Github/monitor-toggle/src/ui/styles.css); added `--on-error` and `--outline-variant` tokens to soften nested containers; added explicit `Error:`/`Warning:` banner prefixes; tracked dismissed poll alerts; scrolled/focused `#cfg-matrix-error` and server-side Settings shortcut errors into view; locked submit button `min-width` during `"Saving…"`.
+- **Control semantics & WCAG 2.5.3**: Converted `#monitors-list` and `#configs-list` to `<ul>`/`<li>` lists with loading placeholders, added `role="group"` + `aria-label` on `#topology-stage` tiles, matched `"Wake All"` button `aria-label` wording (WCAG 2.5.3 Label in Name), disambiguated all `"Record"` buttons, disabled **"Discard changes"** when clean, separated immediate **Appearance theme** from transactional `#settings-form`, exposed `settle_timeout_ms` + `audio_cue_on_force_recover`, and changed **Duplicate** to open an unsaved draft instead of writing before confirmation.

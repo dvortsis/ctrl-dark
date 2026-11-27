@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <script src="/theme.js"></script>
+  <meta name="mt-session-token" content="__MT_SESSION_TOKEN__">
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" href="/mascot.svg" type="image/svg+xml">
+  <title>Ctrl + Dark — Control Panel</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="live-announcer" class="visually-hidden" aria-live="polite"></div>
+
+  <header class="app-header">
+    <div class="header-inner">
+      <div class="brand-block">
+        <span class="brand-icon" aria-hidden="true">
+          <img src="/mascot.svg" alt="" width="30" height="30" decoding="async">
+        </span>
+        <div>
+          <h1 class="app-title">Ctrl+<span class="brand-accent">Dark</span></h1>
+          <div class="status-meta">
+            <span id="phase-badge" class="status-pill">Connecting…</span>
+            <span id="display-summary" class="meta-text tabular-nums">Checking displays…</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <button id="btn-wake-all" type="button" class="btn btn-tonal">Wake All</button>
+        <button id="btn-force-recover" type="button" class="btn btn-outlined">Force Recover</button>
+        <button id="btn-refresh" type="button" class="btn btn-icon" aria-label="Refresh display state" title="Refresh">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path>
+            <path d="M3 3v5h5"></path>
+            <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"></path>
+            <path d="M16 16h5v5"></path>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="main-shell">
+    <div id="alert-banner" class="alert-banner" role="alert" hidden>
+      <span class="alert-content"><strong id="alert-prefix" class="alert-prefix"></strong><span id="alert-text"></span></span>
+      <button id="btn-dismiss-alert" type="button" class="btn-text-sm">Dismiss</button>
+    </div>
+
+    <div id="status-toast" class="status-toast" hidden></div>
+
+    <!-- Connected Displays Overview -->
+    <section class="panel" aria-labelledby="displays-heading">
+      <div class="section-header">
+        <div>
+          <h2 id="displays-heading" class="section-title">Connected Displays</h2>
+          <p class="section-subtitle">Turn off individual displays or restore all displays to your saved layout. Profiles are also available from the system tray.</p>
+        </div>
+        <div class="section-actions">
+          <button id="btn-toggle-externals" type="button" class="btn btn-outlined btn-sm">Toggle Externals</button>
+          <button id="btn-toggle-all" type="button" class="btn btn-outlined btn-sm">Sleep All</button>
+          <button id="btn-snapshot" type="button" class="btn btn-tonal btn-sm">Capture Snapshot</button>
+        </div>
+      </div>
+
+      <div class="displays-layout">
+        <div class="topology-stage-wrap">
+          <div id="topology-stage" class="topology-stage" role="group" aria-label="Display spatial layout"></div>
+        </div>
+        <ul id="monitors-list" class="monitors-grid">
+          <li class="empty-state">Loading connected displays…</li>
+        </ul>
+      </div>
+      <p id="snapshot-meta" class="meta-footnote tabular-nums"></p>
+    </section>
+
+    <!-- User Configurations & Shortcuts -->
+    <section class="panel" aria-labelledby="configs-heading">
+      <div class="section-header">
+        <div>
+          <h2 id="configs-heading" class="section-title">Monitor Configurations &amp; Shortcuts</h2>
+          <p class="section-subtitle">Create unlimited profiles with Included (keep ON) and/or Excluded (turn OFF) displays, optional global shortcuts, and quick tray-menu toggles.</p>
+        </div>
+        <div class="section-actions">
+          <button id="btn-new-config" type="button" class="btn btn-filled">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true">
+              <path d="M12 5v14M5 12h14"></path>
+            </svg>
+            New Configuration
+          </button>
+        </div>
+      </div>
+
+      <ul id="configs-list" class="configs-list">
+        <li class="empty-state">Loading saved configurations…</li>
+      </ul>
+    </section>
+
+    <!-- Global Hotkeys, Behavior & Preferences -->
+    <section class="panel" aria-labelledby="settings-heading">
+      <div class="section-header">
+        <div>
+          <h2 id="settings-heading" class="section-title">Global Shortcuts, Recovery &amp; Appearance</h2>
+          <p class="section-subtitle">Save to apply shortcuts and recovery preferences. Appearance theme updates immediately below.</p>
+        </div>
+      </div>
+
+      <form id="settings-form" action="/api/config" method="post" aria-labelledby="settings-heading" novalidate>
+        <div class="settings-grid">
+          <div class="field">
+            <label for="hk-toggle-all">Toggle All Monitors shortcut</label>
+            <span id="hk-toggle-all-hint" class="hint">Example: Ctrl+Alt+M</span>
+            <div class="input-with-action">
+              <input
+                id="hk-toggle-all"
+                name="toggle_all"
+                type="text"
+                autocorrect="off"
+                autocapitalize="none"
+                spellcheck="false"
+                aria-invalid="false"
+                aria-describedby="hk-toggle-all-hint"
+                data-error="hk-toggle-all-error"
+                placeholder="Ctrl+Alt+M">
+              <button type="button" class="btn btn-outlined btn-sm record-btn" data-record-target="hk-toggle-all" aria-label="Record Toggle All Monitors shortcut">Record</button>
+            </div>
+            <div id="hk-toggle-all-error" class="error-msg"></div>
+          </div>
+
+          <div class="field">
+            <label for="hk-toggle-externals">Toggle External Monitors shortcut</label>
+            <span id="hk-toggle-externals-hint" class="hint">Example: Ctrl+Alt+E (keeps internal laptop panel ON)</span>
+            <div class="input-with-action">
+              <input
+                id="hk-toggle-externals"
+                name="toggle_externals"
+                type="text"
+                autocorrect="off"
+                autocapitalize="none"
+                spellcheck="false"
+                aria-invalid="false"
+                aria-describedby="hk-toggle-externals-hint"
+                data-error="hk-toggle-externals-error"
+                placeholder="Ctrl+Alt+E">
+              <button type="button" class="btn btn-outlined btn-sm record-btn" data-record-target="hk-toggle-externals" aria-label="Record Toggle External Monitors shortcut">Record</button>
+            </div>
+            <div id="hk-toggle-externals-error" class="error-msg"></div>
+          </div>
+
+          <div class="field">
+            <label for="hk-force-recover">Force Recover Displays shortcut</label>
+            <span id="hk-force-recover-hint" class="hint">Blind safety keybind to recover stuck black screens</span>
+            <div class="input-with-action">
+              <input
+                id="hk-force-recover"
+                name="force_recover"
+                type="text"
+                autocorrect="off"
+                autocapitalize="none"
+                spellcheck="false"
+                aria-invalid="false"
+                aria-describedby="hk-force-recover-hint"
+                data-error="hk-force-recover-error"
+                placeholder="Ctrl+Alt+Shift+M">
+              <button type="button" class="btn btn-outlined btn-sm record-btn" data-record-target="hk-force-recover" aria-label="Record Force Recover Displays shortcut">Record</button>
+            </div>
+            <div id="hk-force-recover-error" class="error-msg"></div>
+          </div>
+        </div>
+
+        <div class="settings-two-col">
+          <fieldset class="choice-fieldset">
+            <legend>Full-sleep wake behavior</legend>
+            <label class="choice-row">
+              <input type="radio" name="wake_mode" value="hotkey_only">
+              <span>
+                <strong>Stay off until hotkey (recommended)</strong>
+                <small>Ignores mouse bumps &amp; stray keys when all monitors sleep (Esc × 3 failsafe).</small>
+              </span>
+            </label>
+            <label class="choice-row">
+              <input type="radio" name="wake_mode" value="any_input">
+              <span>
+                <strong>Normal Windows sleep (any input)</strong>
+                <small>Any mouse movement or keypress wakes displays and runs recovery.</small>
+              </span>
+            </label>
+          </fieldset>
+
+          <fieldset class="choice-fieldset">
+            <legend>Display hot-plug settle timing</legend>
+            <div class="field field-compact">
+              <label for="opt-settle-timeout">Wait timeout before topology restore (ms)</label>
+              <span id="opt-settle-timeout-hint" class="hint">Range: 0–30000 ms (4000 ms recommended for USB-C/DisplayLink docks).</span>
+              <input
+                id="opt-settle-timeout"
+                name="settle_timeout_ms"
+                type="number"
+                min="0"
+                max="30000"
+                step="250"
+                aria-invalid="false"
+                aria-describedby="opt-settle-timeout-hint"
+                data-error="opt-settle-timeout-error">
+              <div id="opt-settle-timeout-error" class="error-msg"></div>
+            </div>
+          </fieldset>
+        </div>
+
+        <fieldset class="choice-fieldset">
+          <legend>Startup &amp; display recovery options</legend>
+          <div class="checks-grid">
+            <label class="check-item">
+              <input id="opt-autostart" name="autostart" type="checkbox">
+              <span>Run background daemon at Windows sign-in (HKCU Run)</span>
+            </label>
+            <label class="check-item">
+              <input id="opt-start-minimized" name="start_minimized_to_tray" type="checkbox">
+              <span>Start minimized to system tray (hide window when launching)</span>
+            </label>
+            <label class="check-item">
+              <input id="opt-retrain-usb" name="retrain_usb" type="checkbox">
+              <span>Retrain USB / DisplayLink (IddCx) displays on wake when scanout is missing</span>
+            </label>
+            <label class="check-item">
+              <input id="opt-ddc" name="ddc_assist" type="checkbox">
+              <span>Use bounded DDC/CI VCP wake assist</span>
+            </label>
+            <label class="check-item">
+              <input id="opt-restore-win" name="restore_windows" type="checkbox">
+              <span>Restore window bounds &amp; maximize state after recovery</span>
+            </label>
+            <label class="check-item">
+              <input id="opt-system-wake" name="recover_on_system_wake" type="checkbox">
+              <span>Auto-recover topology on Windows sleep/hibernation resume</span>
+            </label>
+            <label class="check-item">
+              <input id="opt-curtain" name="blackout_curtain" type="checkbox">
+              <span>Keep blackout curtain active in Hotkey-Only sleep lock</span>
+            </label>
+            <label class="check-item">
+              <input id="opt-audio-cue" name="audio_cue" type="checkbox">
+              <span>Play confirmation tone on blind Force Recover</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <div class="form-footer">
+          <span id="settings-dirty-hint" class="meta-text"></span>
+          <button id="btn-revert-settings" type="button" class="btn btn-outlined">Discard changes</button>
+          <button id="btn-save-settings" type="submit" class="btn btn-filled">Save settings</button>
+        </div>
+      </form>
+
+      <div class="appearance-block">
+        <fieldset class="choice-fieldset">
+          <legend id="shortcuts-heading">Desktop &amp; Start Menu Launcher (CtrlDark.exe)</legend>
+          <p class="section-subtitle">Create or remove Windows shortcuts that launch Ctrl + Dark without a console window (respects Start minimized to system tray unless opened again).</p>
+          <div class="shortcut-rows">
+            <div class="shortcut-item">
+              <div class="shortcut-meta">
+                <strong>Start Menu shortcut</strong>
+                <span id="shortcut-sm-status" class="tag">Checking…</span>
+              </div>
+              <button id="btn-shortcut-start-menu" type="button" class="btn btn-outlined btn-sm">Install Start Menu Shortcut</button>
+            </div>
+            <div class="shortcut-item">
+              <div class="shortcut-meta">
+                <strong>Desktop shortcut</strong>
+                <span id="shortcut-desktop-status" class="tag">Checking…</span>
+              </div>
+              <button id="btn-shortcut-desktop" type="button" class="btn btn-outlined btn-sm">Install Desktop Shortcut</button>
+            </div>
+          </div>
+        </fieldset>
+      </div>
+
+      <div class="appearance-block">
+        <fieldset class="choice-fieldset">
+          <legend id="appearance-legend">Appearance theme (applies immediately)</legend>
+          <div class="theme-radios">
+            <label class="choice-row">
+              <input type="radio" name="color_scheme" value="system" checked>
+              <span>
+                <strong id="system-theme-label">System (Currently light)</strong>
+                <small>Matches your Windows light or dark mode.</small>
+              </span>
+            </label>
+            <label class="choice-row">
+              <input type="radio" name="color_scheme" value="light">
+              <span>
+                <strong>Light</strong>
+                <small>Always use light surface colors.</small>
+              </span>
+            </label>
+            <label class="choice-row">
+              <input type="radio" name="color_scheme" value="dark">
+              <span>
+                <strong>Dark</strong>
+                <small>Always use dark surface colors.</small>
+              </span>
+            </label>
+          </div>
+        </fieldset>
+      </div>
+    </section>
+  </main>
+
+  <!-- Native Modal Dialog: Add / Edit Configuration (MANDATORY: no role="dialog" or aria-modal) -->
+  <dialog id="config-dialog" closedby="closerequest" aria-labelledby="config-dialog-title">
+    <form id="config-form" method="post" action="/api/config" novalidate>
+      <div class="dialog-header">
+        <h1 id="config-dialog-title" class="dialog-title">New Monitor Configuration</h1>
+        <button id="btn-close-config-dialog" type="button" class="btn btn-icon" aria-label="Close dialog">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+            <path d="M18 6 6 18M6 6l12 12"></path>
+          </svg>
+        </button>
+      </div>
+
+      <div class="dialog-body">
+        <div id="config-alert" class="dialog-alert alert-banner is-error" role="alert" hidden></div>
+        <div id="config-status" class="dialog-status" role="status" aria-live="polite" hidden></div>
+        <div class="dialog-two-col">
+          <div class="field">
+            <label for="cfg-label">Configuration name <span class="req" aria-hidden="true">*</span></label>
+            <span id="cfg-label-hint" class="hint">Shown in the tray right-click menu and profile list.</span>
+            <input
+              id="cfg-label"
+              name="label"
+              type="text"
+              required
+              maxlength="80"
+              autofocus
+              aria-invalid="false"
+              aria-describedby="cfg-label-hint"
+              data-error="cfg-label-error"
+              placeholder="e.g., Dual 27&quot; Focus">
+            <div id="cfg-label-error" class="error-msg">Enter a configuration name so it can be identified in the tray menu.</div>
+          </div>
+
+          <div class="field">
+            <label for="cfg-hotkey">Keyboard shortcut (optional)</label>
+            <span id="cfg-hotkey-hint" class="hint">Leave blank for tray-menu-only, or press Record (Esc cancels recording).</span>
+            <div class="input-with-action">
+              <input
+                id="cfg-hotkey"
+                name="hotkey"
+                type="text"
+                autocorrect="off"
+                autocapitalize="none"
+                spellcheck="false"
+                aria-invalid="false"
+                aria-describedby="cfg-hotkey-hint"
+                data-error="cfg-hotkey-error"
+                placeholder="Ctrl+Alt+D">
+              <button id="btn-record-cfg-hk" type="button" class="btn btn-outlined btn-sm record-btn" data-record-target="cfg-hotkey" aria-label="Record configuration shortcut">Record</button>
+              <button id="btn-clear-cfg-hk" type="button" class="btn btn-text-sm" aria-label="Clear configuration shortcut">Clear</button>
+            </div>
+            <div id="cfg-hotkey-error" class="error-msg"></div>
+          </div>
+        </div>
+
+        <fieldset class="choice-fieldset">
+          <legend>Action when triggered</legend>
+          <div class="inline-radios">
+            <label class="choice-chip">
+              <input type="radio" name="cfg_action" value="toggle" checked>
+              <span><strong>Toggle</strong> — Switch between this layout and all monitors ON</span>
+            </label>
+            <label class="choice-chip">
+              <input type="radio" name="cfg_action" value="off">
+              <span><strong>Turn Off Only</strong> — Apply this layout even if pressed twice</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset class="matrix-fieldset">
+          <legend>Select Included (Keep ON) and/or Excluded (Turn OFF) monitors</legend>
+          <div class="matrix-toolbar">
+            <span class="hint-inline">If any display is marked <strong>Include</strong>, only Included displays stay ON (unless also Excluded). If none are Included, only Excluded displays turn OFF.</span>
+            <div class="toolbar-btns">
+              <button id="btn-preset-active" type="button" class="btn btn-outlined btn-xs">Include Active</button>
+              <button id="btn-preset-externals" type="button" class="btn btn-outlined btn-xs">Include Externals</button>
+              <button id="btn-preset-clear" type="button" class="btn btn-text-sm">Reset All to Auto</button>
+            </div>
+          </div>
+
+          <div id="monitor-matrix" class="monitor-matrix"></div>
+          <div id="cfg-matrix-error" class="error-msg" role="alert" hidden>Select at least one monitor to Include (Keep ON) or Exclude (Turn OFF), or enter an advanced selector below.</div>
+        </fieldset>
+
+        <details class="advanced-details">
+          <summary>Advanced keyword or role selectors (optional)</summary>
+          <div class="dialog-two-col">
+            <div class="field">
+              <label for="cfg-extra-include">Extra Included selectors (comma-separated)</label>
+              <span id="cfg-extra-inc-hint" class="hint">Examples: externals, internal, EDID code, or monitor name substring.</span>
+              <input
+                id="cfg-extra-include"
+                name="extra_include"
+                type="text"
+                autocorrect="off"
+                autocapitalize="none"
+                spellcheck="false"
+                aria-describedby="cfg-extra-inc-hint">
+            </div>
+            <div class="field">
+              <label for="cfg-extra-exclude">Extra Excluded selectors (comma-separated)</label>
+              <span id="cfg-extra-exc-hint" class="hint">Explicitly forces matching displays OFF even if included above.</span>
+              <input
+                id="cfg-extra-exclude"
+                name="extra_exclude"
+                type="text"
+                autocorrect="off"
+                autocapitalize="none"
+                spellcheck="false"
+                aria-describedby="cfg-extra-exc-hint">
+            </div>
+          </div>
+        </details>
+
+        <div id="outcome-preview" class="outcome-preview" aria-live="polite"></div>
+      </div>
+
+      <div class="dialog-footer">
+        <button id="btn-test-config" type="button" class="btn btn-tonal">Test Layout Now</button>
+        <div class="dialog-footer-right">
+          <button id="btn-cancel-config" type="button" class="btn btn-outlined">Cancel</button>
+          <button id="btn-save-config" type="submit" class="btn btn-filled">Save configuration</button>
+        </div>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Native Modal Dialog: Confirm Delete -->
+  <dialog id="delete-dialog" closedby="any" aria-labelledby="delete-dialog-title">
+    <h1 id="delete-dialog-title" class="dialog-title">Delete Configuration?</h1>
+    <p id="delete-dialog-body" class="dialog-desc">Are you sure you want to remove this monitor configuration and its shortcut?</p>
+    <form method="dialog" class="dialog-footer dialog-footer-end">
+      <button id="btn-delete-cancel" type="submit" value="cancel" class="btn btn-outlined" autofocus>Cancel</button>
+      <button id="btn-delete-confirm" type="submit" value="delete" class="btn btn-danger">Delete configuration</button>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>
