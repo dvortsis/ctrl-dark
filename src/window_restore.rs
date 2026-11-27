@@ -220,7 +220,97 @@ pub fn wait_for_gdi_monitors(
     (t0.elapsed().as_millis() as u64, seen)
 }
 
-/// Restores displaced windows back onto their saved monitor (`SWP_ASYNCWINDOWPOS` + `ShowWindowAsync`).
+const MAX_RESTORE_THREADS: usize = 8;
+
+struct PendingWindowRestore<'a> {
+    window: &'a SavedWindow,
+    cur_show_cmd: u32,
+    target_work: RECT,
+}
+
+fn partition_by_pid_buckets<T>(
+    items: Vec<T>,
+    pid_of: impl Fn(&T) -> u32,
+    max_buckets: usize,
+) -> Vec<Vec<T>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let cap = max_buckets.max(1);
+    let mut pid_order: Vec<u32> = Vec::new();
+    let mut by_pid: HashMap<u32, Vec<T>> = HashMap::new();
+    for item in items {
+        let pid = pid_of(&item);
+        by_pid
+            .entry(pid)
+            .or_insert_with(|| {
+                pid_order.push(pid);
+                Vec::new()
+            })
+            .push(item);
+    }
+    let bucket_count = pid_order.len().min(cap);
+    let mut buckets: Vec<Vec<T>> = (0..bucket_count).map(|_| Vec::new()).collect();
+    for (idx, pid) in pid_order.into_iter().enumerate() {
+        if let Some(group) = by_pid.remove(&pid) {
+            buckets[idx % bucket_count].extend(group);
+        }
+    }
+    buckets
+}
+
+fn restore_one_window(item: &PendingWindowRestore<'_>) {
+    let w = item.window;
+    let hwnd = w.hwnd as HWND;
+    unsafe {
+        if w.is_maximized {
+            let work = item.target_work;
+            let work_w = (work.right - work.left).max(200);
+            let work_h = (work.bottom - work.top).max(150);
+            let norm_w = (w.normal_rect.right - w.normal_rect.left).clamp(200, work_w);
+            let norm_h = (w.normal_rect.bottom - w.normal_rect.top).clamp(150, work_h);
+            let nx = if w.normal_rect.left >= work.left && w.normal_rect.left < work.right - 100 {
+                w.normal_rect.left
+            } else {
+                work.left + 40
+            };
+            let ny = if w.normal_rect.top >= work.top && w.normal_rect.top < work.bottom - 100 {
+                w.normal_rect.top
+            } else {
+                work.top + 40
+            };
+            ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                nx,
+                ny,
+                norm_w,
+                norm_h,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+            );
+            ShowWindowAsync(hwnd, SW_MAXIMIZE);
+        } else {
+            if item.cur_show_cmd == SW_SHOWMAXIMIZED as u32 {
+                ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
+            }
+            let width = (w.window_rect.right - w.window_rect.left).max(100);
+            let height = (w.window_rect.bottom - w.window_rect.top).max(80);
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                w.window_rect.left,
+                w.window_rect.top,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+            );
+        }
+    }
+}
+
+/// Restores displaced windows back onto their saved monitor (`SWP_ASYNCWINDOWPOS` + `ShowWindowAsync`),
+/// running distinct process groups concurrently to avoid cross-process message-queue serialization.
 /// Note: Restoring a previously maximized window via `SW_MAXIMIZE` may activate that window.
 pub fn restore_windows(
     saved: &[SavedWindow],
@@ -242,7 +332,7 @@ pub fn restore_windows(
         return 0;
     }
 
-    let mut restored_count = 0usize;
+    let mut pending = Vec::new();
 
     for w in saved {
         let hwnd = w.hwnd as HWND;
@@ -280,56 +370,36 @@ pub fn restore_windows(
                 continue;
             }
 
-            if w.is_maximized {
-                let work = live_work_by_gdi
-                    .get(target_gdi)
-                    .copied()
-                    .unwrap_or(w.monitor_work);
-                let work_w = (work.right - work.left).max(200);
-                let work_h = (work.bottom - work.top).max(150);
-                let norm_w = (w.normal_rect.right - w.normal_rect.left).clamp(200, work_w);
-                let norm_h = (w.normal_rect.bottom - w.normal_rect.top).clamp(150, work_h);
-                let nx = if w.normal_rect.left >= work.left && w.normal_rect.left < work.right - 100
-                {
-                    w.normal_rect.left
-                } else {
-                    work.left + 40
-                };
-                let ny = if w.normal_rect.top >= work.top && w.normal_rect.top < work.bottom - 100 {
-                    w.normal_rect.top
-                } else {
-                    work.top + 40
-                };
-                ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    nx,
-                    ny,
-                    norm_w,
-                    norm_h,
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
-                );
-                ShowWindowAsync(hwnd, SW_MAXIMIZE);
-            } else {
-                if cur_place.showCmd == SW_SHOWMAXIMIZED as u32 {
-                    ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
-                }
-                let width = (w.window_rect.right - w.window_rect.left).max(100);
-                let height = (w.window_rect.bottom - w.window_rect.top).max(80);
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    w.window_rect.left,
-                    w.window_rect.top,
-                    width,
-                    height,
-                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
-                );
-            }
-
-            restored_count += 1;
+            let target_work = live_work_by_gdi
+                .get(target_gdi)
+                .copied()
+                .unwrap_or(w.monitor_work);
+            pending.push(PendingWindowRestore {
+                window: w,
+                cur_show_cmd: cur_place.showCmd,
+                target_work,
+            });
         }
+    }
+
+    let restored_count = pending.len();
+    let buckets = partition_by_pid_buckets(pending, |p| p.window.pid, MAX_RESTORE_THREADS);
+    if buckets.len() <= 1 {
+        if let Some(bucket) = buckets.first() {
+            for item in bucket {
+                restore_one_window(item);
+            }
+        }
+    } else {
+        thread::scope(|scope| {
+            for bucket in &buckets {
+                scope.spawn(move || {
+                    for item in bucket {
+                        restore_one_window(item);
+                    }
+                });
+            }
+        });
     }
 
     restored_count
@@ -365,5 +435,32 @@ mod tests {
             (screen.left, screen.top, screen.right, screen.bottom),
             (-2496, 148, -1136, 948)
         );
+    }
+
+    #[test]
+    fn partitions_pid_groups_into_bounded_buckets_without_splitting_pids() {
+        let items: Vec<(u32, usize)> = (0..12).map(|i| (100 + (i / 2) as u32, i)).collect();
+        // Also add 4 more distinct PIDs to exceed MAX_RESTORE_THREADS = 8
+        let mut all = items;
+        for extra_pid in 200..204 {
+            all.push((extra_pid, 100 + extra_pid as usize));
+        }
+
+        let buckets = partition_by_pid_buckets(all, |&(pid, _)| pid, MAX_RESTORE_THREADS);
+        assert_eq!(buckets.len(), MAX_RESTORE_THREADS);
+
+        let seen_pids_per_bucket: Vec<HashSet<u32>> = buckets
+            .iter()
+            .map(|b| b.iter().map(|&(pid, _)| pid).collect())
+            .collect();
+        for (i, left) in seen_pids_per_bucket.iter().enumerate() {
+            for (j, right) in seen_pids_per_bucket.iter().enumerate() {
+                if i != j {
+                    assert!(left.is_disjoint(right), "PID split across buckets");
+                }
+            }
+        }
+        let total: usize = buckets.iter().map(|b| b.len()).sum();
+        assert_eq!(total, 16);
     }
 }

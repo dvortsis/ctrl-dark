@@ -424,6 +424,9 @@ pub fn query_available_targets() -> Result<Vec<AvailableCcdTarget>, String> {
 
     let mut out = Vec::with_capacity(map.len());
     for mut agg in map.into_values() {
+        if !agg.target_available && !agg.is_active {
+            continue;
+        }
         agg.source_ids.sort_unstable();
         let meta = query_target_metadata(agg.adapter_id, agg.target_id, agg.output_technology);
         out.push(AvailableCcdTarget {

@@ -131,7 +131,6 @@ enum WorkerJob {
         snapshot: Option<TopologySnapshot>,
         saved_windows: Vec<SavedWindow>,
         wake_ctx: WakeContext,
-        pre_delay_ms: u64,
     },
 }
 
@@ -591,19 +590,19 @@ impl Controller {
     }
 
     pub fn trigger_on(&mut self) {
-        self.trigger_on_with_delay(0);
+        self.trigger_on_with_unlock(false);
     }
 
-    fn trigger_on_with_delay(&mut self, pre_delay_ms: u64) {
+    fn trigger_on_with_unlock(&mut self, from_session_unlock: bool) {
         self.disarm_input_guard();
-        self.trigger_recover_with_delay(false, pre_delay_ms);
+        self.trigger_recover_with_context(false, from_session_unlock);
     }
 
     pub fn trigger_recover(&mut self, hard: bool) {
-        self.trigger_recover_with_delay(hard, 0);
+        self.trigger_recover_with_context(hard, false);
     }
 
-    fn trigger_recover_with_delay(&mut self, hard: bool, pre_delay_ms: u64) {
+    fn trigger_recover_with_context(&mut self, hard: bool, from_session_unlock: bool) {
         self.disarm_input_guard();
         if self.phase == DaemonPhase::Recovering {
             return;
@@ -631,8 +630,8 @@ impl Controller {
             wake_ctx: WakeContext {
                 was_selective_off,
                 console_display_off,
+                from_session_unlock,
             },
-            pre_delay_ms,
         });
     }
 
@@ -728,7 +727,7 @@ impl Controller {
                     } else {
                         DaemonPhase::SelectiveOff
                     };
-                    self.tray_displays = query_displays(true).unwrap_or_default();
+                    self.tray_displays = live;
                     self.update_tray_visual();
                 }
             }
@@ -806,7 +805,7 @@ impl Controller {
                     logging::info(
                         "Session unlock wake enabled; waking monitors and running recovery",
                     );
-                    self.trigger_on_with_delay(250);
+                    self.trigger_on_with_unlock(true);
                 } else if self.phase == DaemonPhase::SleepingNormal
                     && self.last_console_display_state == 1
                 {
@@ -1725,7 +1724,7 @@ fn should_wake_on_session_unlock(wake_on_unlock: bool, phase: &DaemonPhase) -> b
 }
 
 fn lock_workstation_after_action(trigger_vk: Option<u16>, action_desc: &str) {
-    hotkey::wait_for_keys_released(trigger_vk, 800, 80);
+    hotkey::wait_for_keys_released(trigger_vk, 800, 0);
     if unsafe { LockWorkStation() } != 0 {
         logging::info(format!("Locked workstation {action_desc}"));
     } else {
@@ -1850,11 +1849,7 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
                 snapshot,
                 saved_windows,
                 wake_ctx,
-                pre_delay_ms,
             } => {
-                if pre_delay_ms > 0 {
-                    thread::sleep(Duration::from_millis(pre_delay_ms));
-                }
                 let res = run_recovery(
                     level,
                     &config,

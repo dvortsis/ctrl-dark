@@ -44,6 +44,11 @@ pub enum RecoveryLevel {
 pub struct WakeContext {
     pub was_selective_off: bool,
     pub console_display_off: bool,
+    pub from_session_unlock: bool,
+}
+
+fn is_transient_unlock_ccd_error(err: &str) -> bool {
+    err.ends_with("error 5") || err.ends_with("error 31")
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +250,27 @@ pub fn run_recovery(
                         outcome.used_relaxed_timings
                     ));
                 }
+                Err(e) if wake_ctx.from_session_unlock && is_transient_unlock_ccd_error(&e) => {
+                    logging::info(format!(
+                        "Transient CCD lock error on session unlock ({e}); retrying in 150ms"
+                    ));
+                    thread::sleep(Duration::from_millis(150));
+                    let retry_targets = query_available_targets().unwrap_or(avail_targets);
+                    match apply_snapshot_with_targets(snap, &retry_targets, save_db) {
+                        Ok(outcome) => {
+                            topology_restored = true;
+                            used_relaxed_timings = outcome.used_relaxed_timings;
+                            logging::info(format!(
+                                "Stage 2 CCD topology restored on unlock retry (newly_activated={}, relaxed_timings={})",
+                                outcome.newly_activated_keys.len(),
+                                outcome.used_relaxed_timings
+                            ));
+                        }
+                        Err(e2) => {
+                            logging::warn(format!("Stage 2 apply_snapshot warning: {e2}"));
+                        }
+                    }
+                }
                 Err(e) => {
                     logging::warn(format!("Stage 2 apply_snapshot warning: {e}"));
                 }
@@ -335,7 +361,9 @@ pub fn run_recovery(
     }
     let stage3_ms = t3.elapsed().as_millis() as u64;
 
-    live_after_stage2 = query_displays(false)?;
+    if !retrain_gdis.is_empty() || bounced_paths || level == RecoveryLevel::HardBounce {
+        live_after_stage2 = query_displays(false)?;
+    }
     if live_after_stage2.is_empty() {
         return Err("Recovery completed without any active displays".into());
     }
@@ -487,6 +515,7 @@ mod tests {
                 WakeContext {
                     was_selective_off: true,
                     console_display_off: false,
+                    ..WakeContext::default()
                 },
             ),
             0
@@ -498,6 +527,7 @@ mod tests {
                 WakeContext {
                     was_selective_off: false,
                     console_display_off: false,
+                    ..WakeContext::default()
                 },
             ),
             4000
@@ -509,6 +539,7 @@ mod tests {
                 WakeContext {
                     was_selective_off: true,
                     console_display_off: true,
+                    ..WakeContext::default()
                 },
             ),
             4000
@@ -520,6 +551,7 @@ mod tests {
                 WakeContext {
                     was_selective_off: true,
                     console_display_off: false,
+                    ..WakeContext::default()
                 },
             ),
             4000
@@ -574,6 +606,22 @@ mod tests {
             false,
             true,
             false,
+        ));
+    }
+
+    #[test]
+    fn detects_transient_unlock_ccd_errors() {
+        assert!(is_transient_unlock_ccd_error(
+            "SetDisplayConfig(apply_snapshot) failed with error 5"
+        ));
+        assert!(is_transient_unlock_ccd_error(
+            "SetDisplayConfig(apply_snapshot) failed with error 31"
+        ));
+        assert!(!is_transient_unlock_ccd_error(
+            "SetDisplayConfig(apply_snapshot) failed with error 87"
+        ));
+        assert!(!is_transient_unlock_ccd_error(
+            "No feasible, unambiguous saved topology"
         ));
     }
 }

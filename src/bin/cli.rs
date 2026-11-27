@@ -575,6 +575,7 @@ fn run_bench(except: Vec<String>, hold_ms: u64, dry_run: bool) -> Result<(), Str
         WakeContext {
             was_selective_off: true,
             console_display_off: false,
+            from_session_unlock: false,
         },
     )
     .map_err(|e| {
