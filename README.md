@@ -11,6 +11,11 @@
 
 Ctrl + Dark (`monitor-toggle`) is a native Windows 10/11 utility that sleeps all monitors, turns off only external monitors, or toggles custom monitor combinations while protecting against black screens and lost window positions.
 
+<p align="center">
+  <img src="assets/screenshots/control-panel-dark.png" alt="Ctrl + Dark Control Panel in Dark theme showing Selective Off with two active displays, custom profiles, and session lock/unlock checkboxes" width="760"><br>
+  <em>Dark Control Panel showing Selective Off (2/4 displays active), custom profiles, and session lock/unlock toggles.</em>
+</p>
+
 ## Where to find each task
 
 | If you want to | Go to |
@@ -127,11 +132,6 @@ Left-click the tray icon, right-click the tray icon and choose **Open Control Pa
 - **Monitor Configurations & Shortcuts:** Create unlimited profiles selecting **Include (ON)**, **Exclude (OFF)**, or **Auto** per monitor, with optional global shortcuts or blank shortcuts for tray-only toggling.
 - **Global Shortcuts, Recovery & Appearance:** Press **Record** beside any shortcut box to capture a keybind (`Esc` cancels recording), adjust recovery timeouts and independent session lock/unlock toggles, manage **Desktop & Start Menu Launcher (`CtrlDark.exe`)** shortcuts, or switch between **System**, **Light**, and **Dark** themes immediately.
 - **Draft safety:** Refreshing polls do not overwrite unsaved form edits. Select **Discard changes** to reload saved values, or **Save settings** to validate and apply changes.
-
-<p align="center">
-  <img src="assets/screenshots/control-panel-dark.png" alt="Ctrl + Dark Control Panel in Dark theme showing Selective Off with two active displays, custom profiles, and session lock/unlock checkboxes" width="760"><br>
-  <em>Dark Control Panel showing Selective Off (2/4 displays active), custom profiles, and session lock/unlock toggles.</em>
-</p>
 
 > [!NOTE]
 > **Worked example: Creating a custom two-monitor focus profile**
