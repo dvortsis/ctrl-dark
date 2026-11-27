@@ -8,7 +8,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use monitor_toggle::autostart;
 use monitor_toggle::config::{self, AppConfig, WakeMode};
 use monitor_toggle::display::ccd::{
-    deactivate_targets, query_available_targets, query_displays, DeactivateResult,
+    deactivate_targets_timed, query_available_targets, query_displays, DeactivateOutcome,
+    DeactivateResult,
 };
 use monitor_toggle::display::recovery::{run_recovery, RecoveryLevel, WakeContext};
 use monitor_toggle::display::snapshot::{
@@ -592,10 +593,16 @@ fn run_bench(except: Vec<String>, hold_ms: u64, dry_run: bool) -> Result<(), Str
         save_snapshot_atomic(&snap, &snap_path)?;
     }
     let t_off = Instant::now();
-    match deactivate_targets(&keys) {
-        Ok(DeactivateResult::Deactivated(n)) => {
+    match deactivate_targets_timed(&keys, || false) {
+        Ok(DeactivateOutcome {
+            result: DeactivateResult::Deactivated(n),
+            timings,
+        }) => {
             let off_ms = t_off.elapsed().as_millis();
-            println!("Off Latency      : {off_ms} ms ({n} display(s) deactivated)");
+            println!(
+                "Off Latency      : {off_ms} ms ({n} display(s) deactivated; query={}ms, meta={}ms, plan={}ms, apply={}ms)",
+                timings.query_ms, timings.meta_ms, timings.plan_ms, timings.apply_ms
+            );
         }
         Ok(other) => {
             return Err(format!("Unexpected deactivate result: {other:?}"));
@@ -627,13 +634,15 @@ fn run_bench(except: Vec<String>, hold_ms: u64, dry_run: bool) -> Result<(), Str
     })?;
 
     println!(
-        "Recovery Total   : {} ms (Stage1={}ms, Stage2={}ms, Stage3={}ms, Stage4={}ms [gdi_wait={}ms])",
+        "Recovery Total   : {} ms (Stage1={}ms, Stage2={}ms, Stage3={}ms, Stage4={}ms [gdi_wait={}ms, scan={}ms, apply={}ms])",
         report.total_ms,
         report.stage1_ms,
         report.stage2_ms,
         report.stage3_ms,
         report.stage4_ms,
-        report.stage4_gdi_wait_ms
+        report.stage4_gdi_wait_ms,
+        report.stage4_scan_ms,
+        report.stage4_apply_ms
     );
     println!(
         "Details          : topology_restored={}, relaxed_timings={}, retrained={}, bounced={}, windows_restored={}",

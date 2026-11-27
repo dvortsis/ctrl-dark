@@ -24,7 +24,8 @@ use crate::config::{
     self, AppConfig, HotkeyRuleAction, MonitorHotkeyRule, ThemePreference, WakeMode,
 };
 use crate::display::ccd::{
-    deactivate_targets, force_mode_recommit, has_live_gdi_mode, query_displays, DeactivateResult,
+    deactivate_targets_timed, force_mode_recommit, has_live_gdi_mode, query_displays,
+    DeactivateOutcome, DeactivateResult,
 };
 use crate::display::recovery::{
     run_recovery, send_monitors_off_power, RecoveryLevel, RecoveryReport, WakeContext,
@@ -167,6 +168,7 @@ pub enum WorkerResult {
     },
     Failed(String),
     RecoveryFinished(Result<RecoveryReport, String>),
+    NoOp,
 }
 
 #[derive(Debug)]
@@ -791,6 +793,9 @@ impl Controller {
                 continue;
             }
             match completed.result {
+                WorkerResult::NoOp => {
+                    self.selective_job_in_flight = false;
+                }
                 WorkerResult::Failed(error) => {
                     logging::error(&error);
                     self.selective_job_in_flight = false;
@@ -1079,6 +1084,16 @@ impl Controller {
                 let diff = describe_other_topology_diff(&prev, &live, &self.disabled_keys);
                 if !diff.is_empty() {
                     self.last_hpd_diff = diff;
+                }
+                if self.selective_job_in_flight {
+                    let diff_label = if self.last_hpd_diff.is_empty() {
+                        "topology changed"
+                    } else {
+                        self.last_hpd_diff.as_str()
+                    };
+                    logging::info(format!(
+                        "Monitor hot-plug ({diff_label}) arrived while selective-off job is in flight; deferring follow-up to settle timer"
+                    ));
                 }
                 unsafe {
                     SetTimer(self.hwnd as HWND, TIMER_HPD_SETTLE, 500, None);
@@ -2110,52 +2125,94 @@ fn worker_loop(
                 lock_workstation,
                 fallback_dpms_on_access_denied,
             } => {
-                let _op_guard = DisplayOpGuard::try_acquire(2000).ok();
                 let t = Instant::now();
-                match deactivate_targets(&target_keys) {
-                    Ok(DeactivateResult::WouldDisableAll) => {
-                        if fallback_dpms_on_access_denied {
+                let t_guard = Instant::now();
+                let _op_guard = DisplayOpGuard::try_acquire(2000).ok();
+                let guard_ms = t_guard.elapsed().as_millis();
+                if queued.op_id != latest_op.load(Ordering::Acquire) {
+                    logging::info(format!(
+                        "Selective off skipped after guard wait (superseded by newer operation) [guard={guard_ms}ms; targets: {target_names}]"
+                    ));
+                    WorkerResult::NoOp
+                } else {
+                    match deactivate_targets_timed(&target_keys, || {
+                        queued.op_id != latest_op.load(Ordering::Acquire)
+                    }) {
+                        Ok(DeactivateOutcome {
+                            result: DeactivateResult::Superseded,
+                            timings,
+                        }) => {
                             logging::info(format!(
-                                "Locked-session HPD left no other active display; putting displays into DPMS sleep [{target_names}]"
+                                "Selective off skipped before SetDisplayConfig (superseded by newer operation) [guard={guard_ms}ms, query={}ms, meta={}ms, plan={}ms; targets: {target_names}]",
+                                timings.query_ms, timings.meta_ms, timings.plan_ms
+                            ));
+                            WorkerResult::NoOp
+                        }
+                        Ok(DeactivateOutcome {
+                            result: DeactivateResult::WouldDisableAll,
+                            ..
+                        }) => {
+                            if fallback_dpms_on_access_denied {
+                                logging::info(format!(
+                                    "Locked-session HPD left no other active display; putting displays into DPMS sleep [guard={guard_ms}ms; {target_names}]"
+                                ));
+                                send_monitors_off_power(Some(hwnd_raw));
+                                WorkerResult::SelectiveLockedDpmsFallback
+                            } else {
+                                WorkerResult::SelectiveNeedsFullSleep
+                            }
+                        }
+                        Ok(DeactivateOutcome {
+                            result: DeactivateResult::Deactivated(n),
+                            timings,
+                        }) => {
+                            if queued.op_id != latest_op.load(Ordering::Acquire) {
+                                let ms = t.elapsed().as_millis();
+                                logging::info(format!(
+                                    "Selective off deactivated {n} display(s) in {ms}ms (superseded after apply; skipping post-query) [guard={guard_ms}ms, query={}ms, meta={}ms, plan={}ms, apply={}ms; targets: {target_names}]",
+                                    timings.query_ms, timings.meta_ms, timings.plan_ms, timings.apply_ms
+                                ));
+                                WorkerResult::NoOp
+                            } else {
+                                let t_post = Instant::now();
+                                let live_displays = query_displays(true).unwrap_or_default();
+                                let post_ms = t_post.elapsed().as_millis();
+                                let total_ms = t.elapsed().as_millis();
+                                logging::info(format!(
+                                    "Selective off deactivated {n} display(s) in {total_ms}ms [guard={guard_ms}ms, query={}ms, meta={}ms, plan={}ms, apply={}ms, post={post_ms}ms; targets: {target_names}]",
+                                    timings.query_ms, timings.meta_ms, timings.plan_ms, timings.apply_ms
+                                ));
+                                if lock_workstation
+                                    && !lock_workstation_after_action(
+                                        trigger_vk,
+                                        "after selective monitor off",
+                                    )
+                                {
+                                    WorkerResult::LockFailed {
+                                        message: "Monitors changed selectively, but Windows rejected locking the workstation.".into(),
+                                        selective_applied: true,
+                                        live_displays: Some(live_displays),
+                                    }
+                                } else {
+                                    WorkerResult::SelectiveApplied { live_displays }
+                                }
+                            }
+                        }
+                        Ok(DeactivateOutcome {
+                            result: DeactivateResult::NothingMatched,
+                            ..
+                        }) => WorkerResult::Failed(
+                            "No active display matched the requested selection".into(),
+                        ),
+                        Err(e) if fallback_dpms_on_access_denied && e.contains("error 5") => {
+                            logging::info(format!(
+                                "Windows blocked selective CCD re-disable while session locked (error 5) [guard={guard_ms}ms]; putting displays into DPMS sleep [{target_names}]"
                             ));
                             send_monitors_off_power(Some(hwnd_raw));
                             WorkerResult::SelectiveLockedDpmsFallback
-                        } else {
-                            WorkerResult::SelectiveNeedsFullSleep
                         }
+                        Err(e) => WorkerResult::Failed(format!("DeactivateSelective failed: {e}")),
                     }
-                    Ok(DeactivateResult::Deactivated(n)) => {
-                        let ms = t.elapsed().as_millis();
-                        let live_displays = query_displays(true).unwrap_or_default();
-                        logging::info(format!(
-                            "Selective off deactivated {n} display(s) in {ms}ms [targets: {target_names}]"
-                        ));
-                        if lock_workstation
-                            && !lock_workstation_after_action(
-                                trigger_vk,
-                                "after selective monitor off",
-                            )
-                        {
-                            WorkerResult::LockFailed {
-                                message: "Monitors changed selectively, but Windows rejected locking the workstation.".into(),
-                                selective_applied: true,
-                                live_displays: Some(live_displays),
-                            }
-                        } else {
-                            WorkerResult::SelectiveApplied { live_displays }
-                        }
-                    }
-                    Ok(DeactivateResult::NothingMatched) => WorkerResult::Failed(
-                        "No active display matched the requested selection".into(),
-                    ),
-                    Err(e) if fallback_dpms_on_access_denied && e.contains("error 5") => {
-                        logging::info(format!(
-                            "Windows blocked selective CCD re-disable while session locked (error 5); putting displays into DPMS sleep [{target_names}]"
-                        ));
-                        send_monitors_off_power(Some(hwnd_raw));
-                        WorkerResult::SelectiveLockedDpmsFallback
-                    }
-                    Err(e) => WorkerResult::Failed(format!("DeactivateSelective failed: {e}")),
                 }
             }
             WorkerJob::ApplyFilteredSnapshot {
@@ -2166,66 +2223,75 @@ fn worker_loop(
                 lock_workstation,
             } => {
                 let _op_guard = DisplayOpGuard::try_acquire(2000).ok();
-                let t = Instant::now();
-                match apply_snapshot(&filtered_snapshot, false) {
-                    Err(e) => WorkerResult::Failed(format!("ApplyFilteredSnapshot failed: {e}")),
-                    Ok(outcome) => {
-                        let mut retrained_usb = 0usize;
-                        if config.recovery.retrain_usb_displays_on_wake {
-                            let live = query_displays(false).unwrap_or_default();
-                            let usb_gdis: Vec<String> = live
-                                .into_iter()
-                                .filter(|d| {
-                                    d.role == crate::display::DisplayRole::UsbIndirect
-                                        && !d.gdi_name.is_empty()
-                                        && !has_live_gdi_mode(&d.gdi_name)
-                                })
-                                .map(|d| d.gdi_name)
-                                .collect();
-                            if !usb_gdis.is_empty() {
-                                retrained_usb = usb_gdis.len();
-                                let _ = force_mode_recommit(&usb_gdis);
-                            }
+                if queued.op_id != latest_op.load(Ordering::Acquire) {
+                    logging::info(
+                        "ApplyFilteredSnapshot skipped after guard wait (superseded by newer operation)",
+                    );
+                    WorkerResult::NoOp
+                } else {
+                    let t = Instant::now();
+                    match apply_snapshot(&filtered_snapshot, false) {
+                        Err(e) => {
+                            WorkerResult::Failed(format!("ApplyFilteredSnapshot failed: {e}"))
                         }
-                        let live_after = query_displays(true).unwrap_or_default();
-                        let active_after: Vec<&DisplayInfo> =
-                            live_after.iter().filter(|d| d.active).collect();
-                        let required_keys = if expected_keep_keys.is_empty() {
-                            &outcome.restored_keys
-                        } else {
-                            &expected_keep_keys
-                        };
-                        let verified = required_keys.iter().all(|k| {
-                            active_after
-                                .iter()
-                                .any(|d| d.stable_key.eq_ignore_ascii_case(k))
-                        });
-                        if !verified {
-                            WorkerResult::Failed(
+                        Ok(outcome) => {
+                            let mut retrained_usb = 0usize;
+                            if config.recovery.retrain_usb_displays_on_wake {
+                                let live = query_displays(false).unwrap_or_default();
+                                let usb_gdis: Vec<String> = live
+                                    .into_iter()
+                                    .filter(|d| {
+                                        d.role == crate::display::DisplayRole::UsbIndirect
+                                            && !d.gdi_name.is_empty()
+                                            && !has_live_gdi_mode(&d.gdi_name)
+                                    })
+                                    .map(|d| d.gdi_name)
+                                    .collect();
+                                if !usb_gdis.is_empty() {
+                                    retrained_usb = usb_gdis.len();
+                                    let _ = force_mode_recommit(&usb_gdis);
+                                }
+                            }
+                            let live_after = query_displays(true).unwrap_or_default();
+                            let active_after: Vec<&DisplayInfo> =
+                                live_after.iter().filter(|d| d.active).collect();
+                            let required_keys = if expected_keep_keys.is_empty() {
+                                &outcome.restored_keys
+                            } else {
+                                &expected_keep_keys
+                            };
+                            let verified = required_keys.iter().all(|k| {
+                                active_after
+                                    .iter()
+                                    .any(|d| d.stable_key.eq_ignore_ascii_case(k))
+                            });
+                            if !verified {
+                                WorkerResult::Failed(
                                 "ApplyFilteredSnapshot left one or more target displays inactive"
                                     .into(),
                             )
-                        } else {
-                            let ms = t.elapsed().as_millis();
-                            logging::info(format!(
+                            } else {
+                                let ms = t.elapsed().as_millis();
+                                logging::info(format!(
                                 "Selective profile applied in {ms}ms [kept={}, relaxed={}, retrained_usb={retrained_usb}]",
                                 outcome.restored_keys.len(),
                                 outcome.used_relaxed_timings,
                             ));
-                            if lock_workstation
-                                && !lock_workstation_after_action(
-                                    trigger_vk,
-                                    "after applying selective profile",
-                                )
-                            {
-                                WorkerResult::LockFailed {
+                                if lock_workstation
+                                    && !lock_workstation_after_action(
+                                        trigger_vk,
+                                        "after applying selective profile",
+                                    )
+                                {
+                                    WorkerResult::LockFailed {
                                     message: "Layout switched, but Windows rejected locking the workstation.".into(),
                                     selective_applied: true,
                                     live_displays: Some(live_after),
                                 }
-                            } else {
-                                WorkerResult::SelectiveApplied {
-                                    live_displays: live_after,
+                                } else {
+                                    WorkerResult::SelectiveApplied {
+                                        live_displays: live_after,
+                                    }
                                 }
                             }
                         }

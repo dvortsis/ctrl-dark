@@ -63,6 +63,8 @@ pub struct RecoveryReport {
     pub stage3_ms: u64,
     pub stage4_ms: u64,
     pub stage4_gdi_wait_ms: u64,
+    pub stage4_scan_ms: u64,
+    pub stage4_apply_ms: u64,
     pub total_ms: u64,
     pub used_relaxed_timings: bool,
     pub summary: String,
@@ -395,7 +397,7 @@ pub fn run_recovery(
     }
 
     let summary = format!(
-        "Recovery {:?} complete in {}ms [s1={}ms, s2={}ms, s3={}ms, s4={}ms(gdi={}ms,max_win={}ms,thr={},failed={})]: active={}, topology_restored={}, relaxed={}, retrained={}, bounced={}, windows_restored={}",
+        "Recovery {:?} complete in {}ms [s1={}ms, s2={}ms, s3={}ms, s4={}ms(gdi={}ms,scan={}ms[n={},plc={}],apply={}ms,max_win={}ms,thr={},failed={})]: active={}, topology_restored={}, relaxed={}, retrained={}, bounced={}, windows_restored={}",
         level,
         total_ms,
         stage1_ms,
@@ -403,6 +405,10 @@ pub fn run_recovery(
         stage3_ms,
         stage4_ms,
         stage4_gdi_wait_ms,
+        restore_stats.scan_ms,
+        restore_stats.scanned,
+        restore_stats.placement_queries,
+        restore_stats.apply_ms,
         restore_stats.max_window_ms,
         restore_stats.threads_used,
         restore_stats.failed,
@@ -426,6 +432,8 @@ pub fn run_recovery(
         stage3_ms,
         stage4_ms,
         stage4_gdi_wait_ms,
+        stage4_scan_ms: restore_stats.scan_ms,
+        stage4_apply_ms: restore_stats.apply_ms,
         total_ms,
         used_relaxed_timings,
         summary,

@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
+use std::time::Instant;
 
 use windows_sys::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig,
@@ -446,22 +447,51 @@ pub fn query_available_targets() -> Result<Vec<AvailableCcdTarget>, String> {
     Ok(out)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeactivateTimings {
+    pub query_ms: u64,
+    pub meta_ms: u64,
+    pub plan_ms: u64,
+    pub apply_ms: u64,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum DeactivateResult {
     Deactivated(usize),
     WouldDisableAll,
     NothingMatched,
+    Superseded,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeactivateOutcome {
+    pub result: DeactivateResult,
+    pub timings: DeactivateTimings,
 }
 
 /// Deactivates selected active displays via `SetDisplayConfig` without overwriting Windows'
-/// persistent docking database (`SDC_SAVE_TO_DATABASE` is intentionally omitted).
-pub fn deactivate_targets(target_keys: &[String]) -> Result<DeactivateResult, String> {
+/// persistent docking database (`SDC_SAVE_TO_DATABASE` is intentionally omitted), reporting
+/// stage-by-stage timings and checking `should_abort` right before invoking `SetDisplayConfig`.
+pub fn deactivate_targets_timed<F: Fn() -> bool>(
+    target_keys: &[String],
+    should_abort: F,
+) -> Result<DeactivateOutcome, String> {
     if target_keys.is_empty() {
-        return Ok(DeactivateResult::NothingMatched);
+        return Ok(DeactivateOutcome {
+            result: DeactivateResult::NothingMatched,
+            timings: DeactivateTimings::default(),
+        });
     }
     let key_set: HashSet<String> = target_keys.iter().map(|s| s.to_ascii_lowercase()).collect();
-    let raw = query_raw_ccd(true)?;
 
+    let t_query = Instant::now();
+    let raw = query_raw_ccd(true)?;
+    let mut timings = DeactivateTimings {
+        query_ms: t_query.elapsed().as_millis() as u64,
+        ..Default::default()
+    };
+
+    let t_meta = Instant::now();
     let mut kept_paths: Vec<DISPLAYCONFIG_PATH_INFO> = Vec::new();
     let mut deactivated_count = 0usize;
 
@@ -478,19 +508,36 @@ pub fn deactivate_targets(target_keys: &[String]) -> Result<DeactivateResult, St
 
         kept_paths.push(path);
     }
+    timings.meta_ms = t_meta.elapsed().as_millis() as u64;
 
     if deactivated_count == 0 {
-        return Ok(DeactivateResult::NothingMatched);
+        return Ok(DeactivateOutcome {
+            result: DeactivateResult::NothingMatched,
+            timings,
+        });
     }
     if kept_paths.is_empty() {
-        return Ok(DeactivateResult::WouldDisableAll);
+        return Ok(DeactivateOutcome {
+            result: DeactivateResult::WouldDisableAll,
+            timings,
+        });
     }
 
+    let t_plan = Instant::now();
     let mut new_modes = remap_active_modes(&mut kept_paths, &raw.modes);
 
     // Ensure at least one remaining active source mode sits at (0, 0).
     normalize_primary_origin_in_modes(&kept_paths, &mut new_modes);
+    timings.plan_ms = t_plan.elapsed().as_millis() as u64;
 
+    if should_abort() {
+        return Ok(DeactivateOutcome {
+            result: DeactivateResult::Superseded,
+            timings,
+        });
+    }
+
+    let t_apply = Instant::now();
     let rc = unsafe {
         SetDisplayConfig(
             kept_paths.len() as u32,
@@ -500,13 +547,24 @@ pub fn deactivate_targets(target_keys: &[String]) -> Result<DeactivateResult, St
             SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
         )
     };
+    timings.apply_ms = t_apply.elapsed().as_millis() as u64;
     if rc != 0 {
         return Err(format!(
-            "SetDisplayConfig(deactivate_targets) failed with error {rc}"
+            "SetDisplayConfig(deactivate_targets) failed with error {rc} [query={}ms, meta={}ms, plan={}ms, apply={}ms]",
+            timings.query_ms, timings.meta_ms, timings.plan_ms, timings.apply_ms
         ));
     }
 
-    Ok(DeactivateResult::Deactivated(deactivated_count))
+    Ok(DeactivateOutcome {
+        result: DeactivateResult::Deactivated(deactivated_count),
+        timings,
+    })
+}
+
+/// Deactivates selected active displays via `SetDisplayConfig` without overwriting Windows'
+/// persistent docking database (`SDC_SAVE_TO_DATABASE` is intentionally omitted).
+pub fn deactivate_targets(target_keys: &[String]) -> Result<DeactivateResult, String> {
+    deactivate_targets_timed(target_keys, || false).map(|o| o.result)
 }
 
 /// Convert virtual indices to standard indices and share one mode entry per identity.
@@ -740,5 +798,16 @@ mod tests {
         path.flags = DISPLAYCONFIG_PATH_ACTIVE;
         path.sourceInfo.Anonymous.modeInfoIdx = 70000;
         assert_eq!(source_mode_index(&path), Some(70000));
+    }
+
+    #[test]
+    fn deactivate_targets_timed_handles_empty_keys_and_timings_defaults() {
+        let outcome = deactivate_targets_timed(&[], || true).expect("empty keys ok");
+        assert_eq!(outcome.result, DeactivateResult::NothingMatched);
+        assert_eq!(outcome.timings, DeactivateTimings::default());
+        assert_eq!(
+            deactivate_targets(&[]).expect("wrapper ok"),
+            DeactivateResult::NothingMatched
+        );
     }
 }

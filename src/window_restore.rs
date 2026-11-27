@@ -227,8 +227,27 @@ const MAX_RESTORE_THREADS: usize = 8;
 pub struct RestoreStats {
     pub restored: usize,
     pub failed: usize,
+    pub scanned: usize,
+    pub placement_queries: usize,
+    pub scan_ms: u64,
+    pub apply_ms: u64,
     pub threads_used: usize,
     pub max_window_ms: u64,
+}
+
+fn rect_moved_far(cur: RECT, expected: RECT) -> bool {
+    (cur.left - expected.left).abs() > 12
+        || (cur.top - expected.top).abs() > 12
+        || (cur.right - expected.right).abs() > 12
+        || (cur.bottom - expected.bottom).abs() > 12
+}
+
+fn needs_placement_query(is_maximized: bool, rect_moved: bool) -> bool {
+    is_maximized || rect_moved
+}
+
+fn should_restore_window(is_maximized: bool, rect_moved: bool, cur_show_cmd: Option<u32>) -> bool {
+    rect_moved || (is_maximized && cur_show_cmd != Some(SW_SHOWMAXIMIZED as u32))
 }
 
 struct PendingWindowRestore<'a> {
@@ -362,9 +381,15 @@ pub fn restore_windows(
         return RestoreStats::default();
     }
 
+    let t_scan = Instant::now();
+    let scanned = saved.len();
+    let mut placement_queries = 0usize;
     let mut pending = Vec::new();
 
     for w in saved {
+        let Some(target_gdi) = key_to_gdi.get(&w.monitor_stable_key.to_ascii_lowercase()) else {
+            continue;
+        };
         let hwnd = w.hwnd as HWND;
         unsafe {
             if IsWindow(hwnd) == 0 || IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
@@ -375,18 +400,9 @@ pub fn restore_windows(
             if cur_pid != w.pid {
                 continue;
             }
-            let Some(target_gdi) = key_to_gdi.get(&w.monitor_stable_key.to_ascii_lowercase())
-            else {
-                continue;
-            };
 
             let mut cur_rect: RECT = zeroed();
             if GetWindowRect(hwnd, &mut cur_rect) == 0 {
-                continue;
-            }
-            let mut cur_place: WINDOWPLACEMENT = zeroed();
-            cur_place.length = size_of::<WINDOWPLACEMENT>() as u32;
-            if GetWindowPlacement(hwnd, &mut cur_place) == 0 {
                 continue;
             }
 
@@ -400,13 +416,19 @@ pub fn restore_windows(
                 compute_restored_window_rect(w.window_rect, w.monitor_work, target_work)
             };
 
-            let moved_far = (cur_rect.left - expected_rect.left).abs() > 12
-                || (cur_rect.top - expected_rect.top).abs() > 12
-                || (cur_rect.right - expected_rect.right).abs() > 12
-                || (cur_rect.bottom - expected_rect.bottom).abs() > 12
-                || (w.is_maximized && cur_place.showCmd != SW_SHOWMAXIMIZED as u32);
+            let rect_moved = rect_moved_far(cur_rect, expected_rect);
+            if !needs_placement_query(w.is_maximized, rect_moved) {
+                continue;
+            }
 
-            if !moved_far {
+            placement_queries += 1;
+            let mut cur_place: WINDOWPLACEMENT = zeroed();
+            cur_place.length = size_of::<WINDOWPLACEMENT>() as u32;
+            if GetWindowPlacement(hwnd, &mut cur_place) == 0 {
+                continue;
+            }
+
+            if !should_restore_window(w.is_maximized, rect_moved, Some(cur_place.showCmd)) {
                 continue;
             }
 
@@ -418,6 +440,7 @@ pub fn restore_windows(
             });
         }
     }
+    let scan_ms = t_scan.elapsed().as_millis() as u64;
 
     let buckets = partition_into_buckets(pending, MAX_RESTORE_THREADS);
     let threads_used = buckets.len();
@@ -437,6 +460,7 @@ pub fn restore_windows(
         }
     };
 
+    let t_apply = Instant::now();
     if threads_used <= 1 {
         if let Some(bucket) = buckets.first() {
             run_bucket(bucket);
@@ -448,10 +472,15 @@ pub fn restore_windows(
             }
         });
     }
+    let apply_ms = t_apply.elapsed().as_millis() as u64;
 
     RestoreStats {
         restored: restored_ok.load(Ordering::Relaxed),
         failed: restored_failed.load(Ordering::Relaxed),
+        scanned,
+        placement_queries,
+        scan_ms,
+        apply_ms,
         threads_used,
         max_window_ms: max_window_ms.load(Ordering::Relaxed),
     }
@@ -547,5 +576,39 @@ mod tests {
         let clamped = compute_restored_window_rect(far, old_work, new_work);
         assert!(clamped.left >= new_work.left && clamped.right <= new_work.right);
         assert!(clamped.top >= new_work.top && clamped.bottom <= new_work.bottom);
+    }
+
+    #[test]
+    fn unchanged_non_maximized_window_skips_placement_query() {
+        let cur = RECT {
+            left: 100,
+            top: 120,
+            right: 900,
+            bottom: 720,
+        };
+        let within_tolerance = RECT {
+            left: 108,
+            top: 112,
+            right: 896,
+            bottom: 724,
+        };
+        let moved = rect_moved_far(cur, within_tolerance);
+        assert!(!moved);
+        assert!(!needs_placement_query(false, moved));
+        assert!(!should_restore_window(false, moved, None));
+    }
+
+    #[test]
+    fn maximized_or_moved_window_queries_placement_and_restores_appropriately() {
+        assert!(needs_placement_query(true, false));
+        assert!(!should_restore_window(
+            true,
+            false,
+            Some(SW_SHOWMAXIMIZED as u32)
+        ));
+        assert!(should_restore_window(true, false, Some(1)));
+
+        assert!(needs_placement_query(false, true));
+        assert!(should_restore_window(false, true, Some(1)));
     }
 }
