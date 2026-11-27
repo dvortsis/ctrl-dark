@@ -177,8 +177,8 @@ Select the full-sleep mode in the Control Panel under **Full-sleep wake behavior
 
 Configure Windows lock and unlock automation as two independent options in the Control Panel, the system tray right-click menu, or `config.toml`:
 
-- **Lock computer when turning off all monitors** (`lock_workstation_on_sleep`): Calls Windows `LockWorkStation` before sleeping all displays. Input locking (`hotkey_only`) stands down during session lock so the Windows sign-in screen accepts your password or PIN.
-- **Turn monitors back on when unlocking Windows** (`wake_on_session_unlock`): Subscribes to Windows session unlock notifications (`WTS_SESSION_UNLOCK`) and wakes monitors with full topology recovery when you unlock your session. While locked, display wake suppression stays active so background screen flashes on the lock screen do not trigger premature recovery.
+- **Lock computer when turning off monitors** (`lock_workstation_on_sleep`): Calls Windows `LockWorkStation` when turning off monitors via full sleep or selective-off profiles and toggles (automatic hot-plug re-disables do not re-lock). Input locking (`hotkey_only`) stands down during session lock so the Windows sign-in screen accepts your password or PIN.
+- **Turn monitors back on when unlocking Windows** (`wake_on_session_unlock`): Subscribes to Windows session unlock notifications (`WTS_SESSION_UNLOCK`) and wakes or restores all displays with full topology recovery when you unlock Windows from full sleep or `SelectiveOff`. While locked, display change and wake recovery handlers stay paused so background lock-screen events cannot disrupt the sign-in screen.
 
 Both toggles act independently. Enable either option alone or together from **Startup & display recovery options** or the tray items **Lock Computer When Turning Off Monitors** and **Turn Monitors On When Unlocking**.
 
@@ -214,8 +214,8 @@ All persistent settings live in `%APPDATA%\monitor-toggle\config.toml`. You can 
 |---|---|---|---|
 | `start_minimized_to_tray` | Hides the Control Panel window when launching `CtrlDark.exe` cold | `true` | Pass `CtrlDark.exe --open` to force the window open. |
 | `wake_mode` | Controls input locking while all monitors sleep | `"hotkey_only"` | Alternatives: `"any_input"`. `Esc` × 3 unlocks `hotkey_only`. |
-| `lock_workstation_on_sleep` | Locks Windows (`LockWorkStation`) before sleeping all monitors | `false` | Independent of `wake_on_session_unlock`. Temporarily skips `hotkey_only` input lock on the sign-in screen. |
-| `wake_on_session_unlock` | Wakes displays and runs recovery on `WTS_SESSION_UNLOCK` | `false` | Independent of `lock_workstation_on_sleep`. Skips resetting intentional `SelectiveOff` layouts. |
+| `lock_workstation_on_sleep` | Locks Windows (`LockWorkStation`) when turning off monitors (full sleep or selective off) | `false` | Independent of `wake_on_session_unlock`. Excluded on automatic hot-plug re-disables. |
+| `wake_on_session_unlock` | Wakes/restores displays and runs recovery on `WTS_SESSION_UNLOCK` | `false` | Independent of `lock_workstation_on_sleep`. Works from full sleep and `SelectiveOff`. |
 | `hotkeys.toggle_all` | Global hotkey to toggle all displays off/on | `"Ctrl+Alt+M"` | Set `""` to disable the global hotkey. |
 | `hotkeys.toggle_externals` | Global hotkey to toggle external/USB displays only | `"Ctrl+Alt+E"` | Keeps the internal panel ON. |
 | `hotkeys.force_recover` | Blind force-recover and external path bounce hotkey | `"Ctrl+Alt+Shift+M"` | Works even when monitors stay black. |
@@ -240,7 +240,7 @@ start_minimized_to_tray = true
 #   "hotkey_only" - Ignore mouse bumps & stray keys while toggled off (press Esc 3x as failsafe)
 #   "any_input"   - Normal DPMS sleep (any mouse/key or hotkey wakes & recovers displays)
 wake_mode = "hotkey_only"
-# Lock Windows (Win+L equivalent) immediately before putting all monitors to sleep
+# Lock Windows (Win+L equivalent) when turning off monitors
 lock_workstation_on_sleep = false
 # Wake monitors and run display recovery automatically when unlocking Windows
 wake_on_session_unlock = false

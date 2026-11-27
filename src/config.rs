@@ -349,7 +349,7 @@ start_minimized_to_tray = true
 #   "hotkey_only" - Ignore mouse bumps & stray keys while toggled off (press Esc 3x as failsafe)
 #   "any_input"   - Normal DPMS sleep (any mouse/key or hotkey wakes & recovers displays)
 wake_mode = "hotkey_only"
-# Lock Windows (Win+L equivalent) immediately before putting all monitors to sleep
+# Lock Windows (Win+L equivalent) when turning off monitors
 lock_workstation_on_sleep = false
 # Wake monitors and run display recovery automatically when unlocking Windows
 wake_on_session_unlock = false

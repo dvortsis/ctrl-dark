@@ -116,10 +116,14 @@ enum WorkerJob {
     DeactivateSelective {
         target_keys: Vec<String>,
         target_names: String,
+        trigger_vk: Option<u16>,
+        lock_workstation: bool,
     },
     ApplyFilteredSnapshot {
         filtered_snapshot: TopologySnapshot,
         config: AppConfig,
+        trigger_vk: Option<u16>,
+        lock_workstation: bool,
     },
     Recover {
         level: RecoveryLevel,
@@ -127,6 +131,7 @@ enum WorkerJob {
         snapshot: Option<TopologySnapshot>,
         saved_windows: Vec<SavedWindow>,
         wake_ctx: WakeContext,
+        pre_delay_ms: u64,
     },
 }
 
@@ -545,6 +550,8 @@ impl Controller {
                             let _ = self.worker_tx.send(WorkerJob::ApplyFilteredSnapshot {
                                 filtered_snapshot: filtered,
                                 config: self.config.clone(),
+                                trigger_vk,
+                                lock_workstation: self.config.lock_workstation_on_sleep,
                             });
                             return;
                         }
@@ -571,6 +578,8 @@ impl Controller {
                         let _ = self.worker_tx.send(WorkerJob::DeactivateSelective {
                             target_keys: keys,
                             target_names,
+                            trigger_vk,
+                            lock_workstation: self.config.lock_workstation_on_sleep,
                         });
                     }
                     SelectiveOffPlan::NoOp | SelectiveOffPlan::ApplyFilteredKeep(_) => {
@@ -582,11 +591,19 @@ impl Controller {
     }
 
     pub fn trigger_on(&mut self) {
+        self.trigger_on_with_delay(0);
+    }
+
+    fn trigger_on_with_delay(&mut self, pre_delay_ms: u64) {
         self.disarm_input_guard();
-        self.trigger_recover(false);
+        self.trigger_recover_with_delay(false, pre_delay_ms);
     }
 
     pub fn trigger_recover(&mut self, hard: bool) {
+        self.trigger_recover_with_delay(hard, 0);
+    }
+
+    fn trigger_recover_with_delay(&mut self, hard: bool, pre_delay_ms: u64) {
         self.disarm_input_guard();
         if self.phase == DaemonPhase::Recovering {
             return;
@@ -615,6 +632,7 @@ impl Controller {
                 was_selective_off,
                 console_display_off,
             },
+            pre_delay_ms,
         });
     }
 
@@ -788,7 +806,12 @@ impl Controller {
                     logging::info(
                         "Session unlock wake enabled; waking monitors and running recovery",
                     );
-                    self.trigger_on();
+                    self.trigger_on_with_delay(250);
+                } else if self.phase == DaemonPhase::SleepingNormal
+                    && self.last_console_display_state == 1
+                {
+                    self.phase = DaemonPhase::ActiveOn;
+                    self.update_tray_visual();
                 }
             }
             _ => {}
@@ -796,6 +819,9 @@ impl Controller {
     }
 
     pub fn on_display_change(&mut self) {
+        if self.session_locked {
+            return;
+        }
         let live = query_displays(true).unwrap_or_default();
         let prev = std::mem::replace(&mut self.tray_displays, live.clone());
 
@@ -866,6 +892,8 @@ impl Controller {
                     let _ = self.worker_tx.send(WorkerJob::DeactivateSelective {
                         target_keys: keys,
                         target_names: names,
+                        trigger_vk: None,
+                        lock_workstation: false,
                     });
                 }
                 SelectiveChangeAction::SyncDisabledKeys(next_disabled) => {
@@ -1693,7 +1721,16 @@ fn reconcile_disabled_keys(
 }
 
 fn should_wake_on_session_unlock(wake_on_unlock: bool, phase: &DaemonPhase) -> bool {
-    wake_on_unlock && !matches!(phase, DaemonPhase::SelectiveOff | DaemonPhase::Recovering)
+    wake_on_unlock && !matches!(phase, DaemonPhase::Recovering)
+}
+
+fn lock_workstation_after_action(trigger_vk: Option<u16>, action_desc: &str) {
+    hotkey::wait_for_keys_released(trigger_vk, 800, 80);
+    if unsafe { LockWorkStation() } != 0 {
+        logging::info(format!("Locked workstation {action_desc}"));
+    } else {
+        logging::warn(format!("LockWorkStation failed {action_desc}"));
+    }
 }
 
 fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult>) {
@@ -1713,7 +1750,7 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
                         logging::warn("LockWorkStation failed before monitor sleep");
                     }
                     // Give Winlogon time to switch to Secure Desktop before powering off displays.
-                    thread::sleep(Duration::from_millis(250));
+                    thread::sleep(Duration::from_millis(500));
                 }
                 send_monitors_off_power(Some(hwnd_raw));
                 WorkerResult::SleepAllArmed { wake_mode }
@@ -1721,6 +1758,8 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
             WorkerJob::DeactivateSelective {
                 target_keys,
                 target_names,
+                trigger_vk,
+                lock_workstation,
             } => {
                 let t = Instant::now();
                 match deactivate_targets(&target_keys) {
@@ -1731,6 +1770,12 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
                         logging::info(format!(
                             "Selective off deactivated {n} display(s) in {ms}ms [targets: {target_names}]"
                         ));
+                        if lock_workstation {
+                            lock_workstation_after_action(
+                                trigger_vk,
+                                "after selective monitor off",
+                            );
+                        }
                         WorkerResult::SelectiveApplied { live_displays }
                     }
                     Ok(DeactivateResult::NothingMatched) => WorkerResult::Failed(
@@ -1742,6 +1787,8 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
             WorkerJob::ApplyFilteredSnapshot {
                 filtered_snapshot,
                 config,
+                trigger_vk,
+                lock_workstation,
             } => {
                 let t = Instant::now();
                 match apply_snapshot(&filtered_snapshot, false) {
@@ -1784,6 +1831,12 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
                                 outcome.restored_keys.len(),
                                 outcome.used_relaxed_timings,
                             ));
+                            if lock_workstation {
+                                lock_workstation_after_action(
+                                    trigger_vk,
+                                    "after applying selective profile",
+                                );
+                            }
                             WorkerResult::SelectiveApplied {
                                 live_displays: live_after,
                             }
@@ -1797,7 +1850,11 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
                 snapshot,
                 saved_windows,
                 wake_ctx,
+                pre_delay_ms,
             } => {
+                if pre_delay_ms > 0 {
+                    thread::sleep(Duration::from_millis(pre_delay_ms));
+                }
                 let res = run_recovery(
                     level,
                     &config,
@@ -2287,9 +2344,12 @@ mod tests {
             true,
             &DaemonPhase::RecoveryFailed
         ));
-
-        assert!(!should_wake_on_session_unlock(
+        assert!(should_wake_on_session_unlock(
             true,
+            &DaemonPhase::SelectiveOff
+        ));
+        assert!(!should_wake_on_session_unlock(
+            false,
             &DaemonPhase::SelectiveOff
         ));
         assert!(!should_wake_on_session_unlock(
