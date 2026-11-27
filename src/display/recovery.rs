@@ -377,13 +377,14 @@ pub fn run_recovery(
     // Stage 4: Wait briefly for GDI monitor registration only if needed, then async-restore windows.
     let t4 = Instant::now();
     let mut stage4_gdi_wait_ms = 0u64;
-    let windows_restored = if config.recovery.restore_windows && !saved_windows.is_empty() {
+    let restore_stats = if config.recovery.restore_windows && !saved_windows.is_empty() {
         let (gdi_wait, live_work) = window_restore::wait_for_gdi_monitors(&live_after_stage2, 200);
         stage4_gdi_wait_ms = gdi_wait;
         window_restore::restore_windows(saved_windows, &live_after_stage2, &live_work)
     } else {
-        0
+        window_restore::RestoreStats::default()
     };
+    let windows_restored = restore_stats.restored;
     let stage4_ms = t4.elapsed().as_millis() as u64;
     let total_ms = t_total.elapsed().as_millis() as u64;
 
@@ -394,7 +395,7 @@ pub fn run_recovery(
     }
 
     let summary = format!(
-        "Recovery {:?} complete in {}ms [s1={}ms, s2={}ms, s3={}ms, s4={}ms(gdi={}ms)]: active={}, topology_restored={}, relaxed={}, retrained={}, bounced={}, windows_restored={}",
+        "Recovery {:?} complete in {}ms [s1={}ms, s2={}ms, s3={}ms, s4={}ms(gdi={}ms,max_win={}ms,thr={})]: active={}, topology_restored={}, relaxed={}, retrained={}, bounced={}, windows_restored={}",
         level,
         total_ms,
         stage1_ms,
@@ -402,6 +403,8 @@ pub fn run_recovery(
         stage3_ms,
         stage4_ms,
         stage4_gdi_wait_ms,
+        restore_stats.max_window_ms,
+        restore_stats.threads_used,
         live_after_stage2.len(),
         topology_restored,
         used_relaxed_timings,

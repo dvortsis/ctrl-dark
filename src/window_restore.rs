@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,8 +16,8 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowLongW, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetWindowPos, ShowWindowAsync,
-    GWL_EXSTYLE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SW_MAXIMIZE, SW_SHOWMAXIMIZED,
-    SW_SHOWNOACTIVATE, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
+    GWL_EXSTYLE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    SW_MAXIMIZE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
 
 use crate::display::DisplayInfo;
@@ -222,44 +223,35 @@ pub fn wait_for_gdi_monitors(
 
 const MAX_RESTORE_THREADS: usize = 8;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RestoreStats {
+    pub restored: usize,
+    pub threads_used: usize,
+    pub max_window_ms: u64,
+}
+
 struct PendingWindowRestore<'a> {
     window: &'a SavedWindow,
     cur_show_cmd: u32,
+    cur_rect: RECT,
     target_work: RECT,
 }
 
-fn partition_by_pid_buckets<T>(
-    items: Vec<T>,
-    pid_of: impl Fn(&T) -> u32,
-    max_buckets: usize,
-) -> Vec<Vec<T>> {
+fn partition_into_buckets<T>(items: Vec<T>, max_buckets: usize) -> Vec<Vec<T>> {
     if items.is_empty() {
         return Vec::new();
     }
     let cap = max_buckets.max(1);
-    let mut pid_order: Vec<u32> = Vec::new();
-    let mut by_pid: HashMap<u32, Vec<T>> = HashMap::new();
-    for item in items {
-        let pid = pid_of(&item);
-        by_pid
-            .entry(pid)
-            .or_insert_with(|| {
-                pid_order.push(pid);
-                Vec::new()
-            })
-            .push(item);
-    }
-    let bucket_count = pid_order.len().min(cap);
+    let bucket_count = items.len().min(cap);
     let mut buckets: Vec<Vec<T>> = (0..bucket_count).map(|_| Vec::new()).collect();
-    for (idx, pid) in pid_order.into_iter().enumerate() {
-        if let Some(group) = by_pid.remove(&pid) {
-            buckets[idx % bucket_count].extend(group);
-        }
+    for (idx, item) in items.into_iter().enumerate() {
+        buckets[idx % bucket_count].push(item);
     }
     buckets
 }
 
-fn restore_one_window(item: &PendingWindowRestore<'_>) {
+fn restore_one_window(item: &PendingWindowRestore<'_>) -> u64 {
+    let t0 = Instant::now();
     let w = item.window;
     let hwnd = w.hwnd as HWND;
     unsafe {
@@ -279,7 +271,9 @@ fn restore_one_window(item: &PendingWindowRestore<'_>) {
             } else {
                 work.top + 40
             };
-            ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
+            if item.cur_show_cmd == SW_SHOWMAXIMIZED as u32 {
+                ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
+            }
             SetWindowPos(
                 hwnd,
                 null_mut(),
@@ -287,7 +281,7 @@ fn restore_one_window(item: &PendingWindowRestore<'_>) {
                 ny,
                 norm_w,
                 norm_h,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
             );
             ShowWindowAsync(hwnd, SW_MAXIMIZE);
         } else {
@@ -296,6 +290,13 @@ fn restore_one_window(item: &PendingWindowRestore<'_>) {
             }
             let width = (w.window_rect.right - w.window_rect.left).max(100);
             let height = (w.window_rect.bottom - w.window_rect.top).max(80);
+            let cur_w = item.cur_rect.right - item.cur_rect.left;
+            let cur_h = item.cur_rect.bottom - item.cur_rect.top;
+            let size_flag = if cur_w == width && cur_h == height {
+                SWP_NOSIZE
+            } else {
+                0
+            };
             SetWindowPos(
                 hwnd,
                 null_mut(),
@@ -303,20 +304,21 @@ fn restore_one_window(item: &PendingWindowRestore<'_>) {
                 w.window_rect.top,
                 width,
                 height,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS | size_flag,
             );
         }
     }
+    t0.elapsed().as_millis() as u64
 }
 
 /// Restores displaced windows back onto their saved monitor (`SWP_ASYNCWINDOWPOS` + `ShowWindowAsync`),
-/// running distinct process groups concurrently to avoid cross-process message-queue serialization.
+/// dispatching distinct `HWND`s concurrently up to `MAX_RESTORE_THREADS` while preserving per-window call ordering.
 /// Note: Restoring a previously maximized window via `SW_MAXIMIZE` may activate that window.
 pub fn restore_windows(
     saved: &[SavedWindow],
     current_displays: &[DisplayInfo],
     live_work_by_gdi: &HashMap<String, RECT>,
-) -> usize {
+) -> RestoreStats {
     let key_to_gdi: HashMap<String, String> = current_displays
         .iter()
         .filter(|d| d.active && !d.gdi_name.is_empty())
@@ -329,7 +331,7 @@ pub fn restore_windows(
         .collect();
 
     if key_to_gdi.is_empty() {
-        return 0;
+        return RestoreStats::default();
     }
 
     let mut pending = Vec::new();
@@ -377,32 +379,43 @@ pub fn restore_windows(
             pending.push(PendingWindowRestore {
                 window: w,
                 cur_show_cmd: cur_place.showCmd,
+                cur_rect,
                 target_work,
             });
         }
     }
 
     let restored_count = pending.len();
-    let buckets = partition_by_pid_buckets(pending, |p| p.window.pid, MAX_RESTORE_THREADS);
-    if buckets.len() <= 1 {
+    let buckets = partition_into_buckets(pending, MAX_RESTORE_THREADS);
+    let threads_used = buckets.len();
+    let max_window_ms = AtomicU64::new(0);
+
+    if threads_used <= 1 {
         if let Some(bucket) = buckets.first() {
             for item in bucket {
-                restore_one_window(item);
+                let elapsed = restore_one_window(item);
+                max_window_ms.fetch_max(elapsed, Ordering::Relaxed);
             }
         }
     } else {
         thread::scope(|scope| {
+            let max_ref = &max_window_ms;
             for bucket in &buckets {
                 scope.spawn(move || {
                     for item in bucket {
-                        restore_one_window(item);
+                        let elapsed = restore_one_window(item);
+                        max_ref.fetch_max(elapsed, Ordering::Relaxed);
                     }
                 });
             }
         });
     }
 
-    restored_count
+    RestoreStats {
+        restored: restored_count,
+        threads_used,
+        max_window_ms: max_window_ms.load(Ordering::Relaxed),
+    }
 }
 
 #[cfg(test)]
@@ -438,29 +451,18 @@ mod tests {
     }
 
     #[test]
-    fn partitions_pid_groups_into_bounded_buckets_without_splitting_pids() {
-        let items: Vec<(u32, usize)> = (0..12).map(|i| (100 + (i / 2) as u32, i)).collect();
-        // Also add 4 more distinct PIDs to exceed MAX_RESTORE_THREADS = 8
-        let mut all = items;
-        for extra_pid in 200..204 {
-            all.push((extra_pid, 100 + extra_pid as usize));
-        }
+    fn partitions_windows_round_robin_up_to_thread_cap() {
+        assert!(partition_into_buckets::<usize>(Vec::new(), MAX_RESTORE_THREADS).is_empty());
 
-        let buckets = partition_by_pid_buckets(all, |&(pid, _)| pid, MAX_RESTORE_THREADS);
+        let small = partition_into_buckets(vec![10, 20, 30], MAX_RESTORE_THREADS);
+        assert_eq!(small.len(), 3);
+        assert_eq!(small, vec![vec![10], vec![20], vec![30]]);
+
+        let many: Vec<usize> = (0..18).collect();
+        let buckets = partition_into_buckets(many, MAX_RESTORE_THREADS);
         assert_eq!(buckets.len(), MAX_RESTORE_THREADS);
-
-        let seen_pids_per_bucket: Vec<HashSet<u32>> = buckets
-            .iter()
-            .map(|b| b.iter().map(|&(pid, _)| pid).collect())
-            .collect();
-        for (i, left) in seen_pids_per_bucket.iter().enumerate() {
-            for (j, right) in seen_pids_per_bucket.iter().enumerate() {
-                if i != j {
-                    assert!(left.is_disjoint(right), "PID split across buckets");
-                }
-            }
-        }
-        let total: usize = buckets.iter().map(|b| b.len()).sum();
-        assert_eq!(total, 16);
+        let flattened: HashSet<usize> = buckets.iter().flatten().copied().collect();
+        assert_eq!(flattened.len(), 18);
+        assert!(buckets.iter().all(|b| (2..=3).contains(&b.len())));
     }
 }

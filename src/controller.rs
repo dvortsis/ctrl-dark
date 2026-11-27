@@ -118,6 +118,7 @@ enum WorkerJob {
         target_names: String,
         trigger_vk: Option<u16>,
         lock_workstation: bool,
+        fallback_dpms_on_access_denied: bool,
     },
     ApplyFilteredSnapshot {
         filtered_snapshot: TopologySnapshot,
@@ -138,6 +139,7 @@ enum WorkerJob {
 pub enum WorkerResult {
     SleepAllArmed { wake_mode: WakeMode },
     SelectiveApplied { live_displays: Vec<DisplayInfo> },
+    SelectiveLockedDpmsFallback,
     SelectiveNeedsFullSleep,
     Failed(String),
     RecoveryFinished(Result<RecoveryReport, String>),
@@ -177,6 +179,7 @@ pub struct Controller {
     console_off_since: Option<Instant>,
     last_resleep_pulse: Option<Instant>,
     selective_job_in_flight: bool,
+    locked_hpd_reenforce_pending: bool,
     last_hpd_change_at: Option<Instant>,
     last_hpd_diff: String,
     last_reenforce_at: Option<Instant>,
@@ -261,6 +264,7 @@ impl Controller {
             console_off_since: None,
             last_resleep_pulse: None,
             selective_job_in_flight: false,
+            locked_hpd_reenforce_pending: false,
             last_hpd_change_at: None,
             last_hpd_diff: String::new(),
             last_reenforce_at: None,
@@ -491,6 +495,7 @@ impl Controller {
                     self.disarm_input_guard();
                 }
                 self.selective_job_in_flight = false;
+                self.locked_hpd_reenforce_pending = false;
                 self.last_hpd_change_at = None;
                 self.last_hpd_diff.clear();
                 self.last_reenforce_at = None;
@@ -500,12 +505,12 @@ impl Controller {
                 } else {
                     DaemonPhase::SleepingNormal
                 };
-                self.update_tray_visual();
                 let _ = self.worker_tx.send(WorkerJob::SleepAll {
                     trigger_vk,
                     wake_mode,
                     lock_workstation,
                 });
+                self.update_tray_visual();
             }
             TargetScope::ExternalsOnly
             | TargetScope::Monitor(_)
@@ -545,13 +550,13 @@ impl Controller {
                             self.phase = DaemonPhase::SelectiveOff;
                             self.disabled_keys = disabled_keys;
                             self.selective_job_in_flight = true;
-                            self.update_tray_visual();
                             let _ = self.worker_tx.send(WorkerJob::ApplyFilteredSnapshot {
                                 filtered_snapshot: filtered,
                                 config: self.config.clone(),
                                 trigger_vk,
                                 lock_workstation: self.config.lock_workstation_on_sleep,
                             });
+                            self.update_tray_visual();
                             return;
                         }
                     }
@@ -573,13 +578,14 @@ impl Controller {
                         }
                         let target_names = describe_keys(&all_connected, &keys);
                         self.selective_job_in_flight = true;
-                        self.update_tray_visual();
                         let _ = self.worker_tx.send(WorkerJob::DeactivateSelective {
                             target_keys: keys,
                             target_names,
                             trigger_vk,
                             lock_workstation: self.config.lock_workstation_on_sleep,
+                            fallback_dpms_on_access_denied: false,
                         });
+                        self.update_tray_visual();
                     }
                     SelectiveOffPlan::NoOp | SelectiveOffPlan::ApplyFilteredKeep(_) => {
                         logging::warn(format!("No active display matched scope {scope:?}"));
@@ -610,12 +616,12 @@ impl Controller {
         let was_selective_off = self.phase == DaemonPhase::SelectiveOff;
         let console_display_off = self.last_console_display_state == 0;
         self.selective_job_in_flight = false;
+        self.locked_hpd_reenforce_pending = false;
         self.last_hpd_change_at = None;
         self.last_hpd_diff.clear();
         self.last_reenforce_at = None;
         self.reenforce_attempts_for_hpd = 0;
         self.phase = DaemonPhase::Recovering;
-        self.update_tray_visual();
 
         let level = if hard {
             RecoveryLevel::HardBounce
@@ -633,6 +639,7 @@ impl Controller {
                 from_session_unlock,
             },
         });
+        self.update_tray_visual();
     }
 
     pub fn on_worker_done(&mut self) {
@@ -696,6 +703,11 @@ impl Controller {
                         }
                     }
                     self.tray_displays = live_displays;
+                    self.update_tray_visual();
+                }
+                WorkerResult::SelectiveLockedDpmsFallback => {
+                    self.selective_job_in_flight = false;
+                    self.locked_hpd_reenforce_pending = true;
                     self.update_tray_visual();
                 }
                 WorkerResult::SelectiveNeedsFullSleep => {
@@ -800,12 +812,65 @@ impl Controller {
             }
             WTS_SESSION_UNLOCK => {
                 self.session_locked = false;
+                let pending_reenforce = std::mem::take(&mut self.locked_hpd_reenforce_pending);
                 logging::info("Windows session unlocked");
                 if should_wake_on_session_unlock(self.config.wake_on_session_unlock, &self.phase) {
                     logging::info(
                         "Session unlock wake enabled; waking monitors and running recovery",
                     );
                     self.trigger_on_with_unlock(true);
+                } else if pending_reenforce
+                    && self.phase == DaemonPhase::SelectiveOff
+                    && !self.disabled_keys.is_empty()
+                {
+                    let live = query_displays(true).unwrap_or_default();
+                    let reactivated: Vec<String> = live
+                        .iter()
+                        .filter(|d| {
+                            d.available
+                                && d.active
+                                && self
+                                    .disabled_keys
+                                    .iter()
+                                    .any(|k| k.eq_ignore_ascii_case(&d.stable_key))
+                        })
+                        .map(|d| d.stable_key.clone())
+                        .collect();
+                    let other_active = live
+                        .iter()
+                        .filter(|d| {
+                            d.available
+                                && d.active
+                                && !self
+                                    .disabled_keys
+                                    .iter()
+                                    .any(|k| k.eq_ignore_ascii_case(&d.stable_key))
+                        })
+                        .count();
+                    if !reactivated.is_empty() && other_active > 0 {
+                        let names = describe_keys(&live, &reactivated);
+                        logging::info(format!(
+                            "Re-applying selective off on session unlock after locked-session hot-plug [{names}]"
+                        ));
+                        self.selective_job_in_flight = true;
+                        let _ = self.worker_tx.send(WorkerJob::DeactivateSelective {
+                            target_keys: reactivated,
+                            target_names: names,
+                            trigger_vk: None,
+                            lock_workstation: false,
+                            fallback_dpms_on_access_denied: false,
+                        });
+                    } else if other_active == 0 {
+                        self.disabled_keys = live
+                            .iter()
+                            .filter(|d| d.available && !d.active)
+                            .map(|d| d.stable_key.clone())
+                            .collect();
+                        if self.disabled_keys.is_empty() {
+                            self.phase = DaemonPhase::ActiveOn;
+                        }
+                        self.update_tray_visual();
+                    }
                 } else if self.phase == DaemonPhase::SleepingNormal
                     && self.last_console_display_state == 1
                 {
@@ -818,21 +883,20 @@ impl Controller {
     }
 
     pub fn on_display_change(&mut self) {
-        if self.session_locked {
-            return;
-        }
         let live = query_displays(true).unwrap_or_default();
         let prev = std::mem::replace(&mut self.tray_displays, live.clone());
 
         if self.phase == DaemonPhase::ActiveOn {
-            if let Ok(live_snap) = capture_active_snapshot() {
-                let should_update = match &self.snapshot {
-                    None => true,
-                    Some(prev_snap) => live_snap.monitors.len() >= prev_snap.monitors.len(),
-                };
-                if should_update {
-                    let _ = save_snapshot_atomic(&live_snap, &config::snapshot_path());
-                    self.snapshot = Some(live_snap);
+            if !self.session_locked {
+                if let Ok(live_snap) = capture_active_snapshot() {
+                    let should_update = match &self.snapshot {
+                        None => true,
+                        Some(prev_snap) => live_snap.monitors.len() >= prev_snap.monitors.len(),
+                    };
+                    if should_update {
+                        let _ = save_snapshot_atomic(&live_snap, &config::snapshot_path());
+                        self.snapshot = Some(live_snap);
+                    }
                 }
             }
         } else if self.phase == DaemonPhase::SelectiveOff && !self.disabled_keys.is_empty() {
@@ -847,6 +911,10 @@ impl Controller {
                 unsafe {
                     SetTimer(self.hwnd as HWND, TIMER_HPD_SETTLE, 500, None);
                 }
+            }
+
+            if self.session_locked && self.last_console_display_state == 0 {
+                return;
             }
 
             let within_hpd_window = other_changed
@@ -865,6 +933,7 @@ impl Controller {
                 self.selective_job_in_flight,
                 self.reenforce_attempts_for_hpd,
                 cooldown_elapsed,
+                self.session_locked,
             ) {
                 SelectiveChangeAction::ReDeactivate(keys) => {
                     let names = describe_keys(&live, &keys);
@@ -893,6 +962,7 @@ impl Controller {
                         target_names: names,
                         trigger_vk: None,
                         lock_workstation: false,
+                        fallback_dpms_on_access_denied: self.session_locked,
                     });
                 }
                 SelectiveChangeAction::SyncDisabledKeys(next_disabled) => {
@@ -1491,6 +1561,7 @@ fn plan_selective_display_change(
     selective_job_in_flight: bool,
     reenforce_attempts: u32,
     cooldown_elapsed: bool,
+    session_locked: bool,
 ) -> SelectiveChangeAction {
     let reactivated: Vec<String> = curr_displays
         .iter()
@@ -1510,7 +1581,11 @@ fn plan_selective_display_change(
         .collect();
 
     if reactivated.is_empty() {
-        if still_disabled.is_empty() && !within_hpd_window && !selective_job_in_flight {
+        if !session_locked
+            && still_disabled.is_empty()
+            && !within_hpd_window
+            && !selective_job_in_flight
+        {
             return SelectiveChangeAction::SyncDisabledKeys(Vec::new());
         }
         return SelectiveChangeAction::None;
@@ -1527,8 +1602,9 @@ fn plan_selective_display_change(
         })
         .count();
 
-    // Never turn off the last remaining active screen when an external monitor disconnects.
-    if remaining_other_active == 0 {
+    // Never turn off the last remaining active screen when an external monitor disconnects
+    // in an unlocked session. While locked, keep disabled keys protected via DPMS fallback.
+    if !session_locked && remaining_other_active == 0 {
         return SelectiveChangeAction::SyncDisabledKeys(still_disabled);
     }
 
@@ -1537,7 +1613,11 @@ fn plan_selective_display_change(
             return SelectiveChangeAction::None;
         }
         if reenforce_attempts >= HPD_MAX_REENFORCE_ATTEMPTS {
-            return SelectiveChangeAction::SyncDisabledKeys(still_disabled);
+            return if session_locked {
+                SelectiveChangeAction::None
+            } else {
+                SelectiveChangeAction::SyncDisabledKeys(still_disabled)
+            };
         }
         if !cooldown_elapsed {
             return SelectiveChangeAction::None;
@@ -1545,7 +1625,7 @@ fn plan_selective_display_change(
         return SelectiveChangeAction::ReDeactivate(reactivated);
     }
 
-    if selective_job_in_flight {
+    if session_locked || selective_job_in_flight {
         return SelectiveChangeAction::None;
     }
     SelectiveChangeAction::SyncDisabledKeys(still_disabled)
@@ -1759,10 +1839,21 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
                 target_names,
                 trigger_vk,
                 lock_workstation,
+                fallback_dpms_on_access_denied,
             } => {
                 let t = Instant::now();
                 match deactivate_targets(&target_keys) {
-                    Ok(DeactivateResult::WouldDisableAll) => WorkerResult::SelectiveNeedsFullSleep,
+                    Ok(DeactivateResult::WouldDisableAll) => {
+                        if fallback_dpms_on_access_denied {
+                            logging::info(format!(
+                                "Locked-session HPD left no other active display; putting displays into DPMS sleep [{target_names}]"
+                            ));
+                            send_monitors_off_power(Some(hwnd_raw));
+                            WorkerResult::SelectiveLockedDpmsFallback
+                        } else {
+                            WorkerResult::SelectiveNeedsFullSleep
+                        }
+                    }
                     Ok(DeactivateResult::Deactivated(n)) => {
                         let ms = t.elapsed().as_millis();
                         let live_displays = query_displays(true).unwrap_or_default();
@@ -1780,6 +1871,13 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
                     Ok(DeactivateResult::NothingMatched) => WorkerResult::Failed(
                         "No active display matched the requested selection".into(),
                     ),
+                    Err(e) if fallback_dpms_on_access_denied && e.contains("error 5") => {
+                        logging::info(format!(
+                            "Windows blocked selective CCD re-disable while session locked (error 5); putting displays into DPMS sleep [{target_names}]"
+                        ));
+                        send_monitors_off_power(Some(hwnd_raw));
+                        WorkerResult::SelectiveLockedDpmsFallback
+                    }
                     Err(e) => WorkerResult::Failed(format!("DeactivateSelective failed: {e}")),
                 }
             }
@@ -2151,7 +2249,7 @@ mod tests {
         ];
         assert!(other_topology_changed(&prev_off, &curr_off, &disabled));
         assert_eq!(
-            plan_selective_display_change(&curr_off, &disabled, true, false, 0, true),
+            plan_selective_display_change(&curr_off, &disabled, true, false, 0, true, false),
             SelectiveChangeAction::ReDeactivate(vec!["display#len8aa5#4".into()])
         );
 
@@ -2178,7 +2276,7 @@ mod tests {
         ];
         assert!(other_topology_changed(&prev_on, &curr_on, &disabled));
         assert_eq!(
-            plan_selective_display_change(&curr_on, &disabled, true, false, 0, true),
+            plan_selective_display_change(&curr_on, &disabled, true, false, 0, true, false),
             SelectiveChangeAction::ReDeactivate(vec!["display#len8aa5#4".into()])
         );
     }
@@ -2203,8 +2301,59 @@ mod tests {
         )];
         assert!(other_topology_changed(&prev, &curr, &disabled));
         assert_eq!(
-            plan_selective_display_change(&curr, &disabled, true, false, 0, true),
+            plan_selective_display_change(&curr, &disabled, true, false, 0, true, false),
             SelectiveChangeAction::SyncDisabledKeys(Vec::new())
+        );
+    }
+
+    #[test]
+    fn locked_session_hpd_keeps_disabled_keys_and_reenforces_even_if_all_externals_power_off() {
+        let disabled = vec![
+            "display#len8aa5#4".to_string(),
+            "display#aus1641#3".to_string(),
+        ];
+        let curr_only_internal_left = vec![make_disp(
+            "display#len8aa5#4",
+            "Internal Display",
+            DisplayRole::Internal,
+            true,
+        )];
+        assert_eq!(
+            plan_selective_display_change(
+                &curr_only_internal_left,
+                &disabled,
+                true,
+                false,
+                0,
+                true,
+                true
+            ),
+            SelectiveChangeAction::ReDeactivate(vec!["display#len8aa5#4".into()])
+        );
+        // Never drops disabled keys when HPD retries finish or outside HPD window while locked.
+        assert_eq!(
+            plan_selective_display_change(
+                &curr_only_internal_left,
+                &disabled,
+                true,
+                false,
+                2,
+                true,
+                true
+            ),
+            SelectiveChangeAction::None
+        );
+        assert_eq!(
+            plan_selective_display_change(
+                &curr_only_internal_left,
+                &disabled,
+                false,
+                false,
+                0,
+                true,
+                true
+            ),
+            SelectiveChangeAction::None
         );
     }
 
@@ -2222,15 +2371,15 @@ mod tests {
         ];
 
         assert_eq!(
-            plan_selective_display_change(&curr, &disabled, false, false, 0, true),
+            plan_selective_display_change(&curr, &disabled, false, false, 0, true, false),
             SelectiveChangeAction::SyncDisabledKeys(Vec::new())
         );
         assert_eq!(
-            plan_selective_display_change(&curr, &disabled, true, false, 2, true),
+            plan_selective_display_change(&curr, &disabled, true, false, 2, true, false),
             SelectiveChangeAction::SyncDisabledKeys(Vec::new())
         );
         assert_eq!(
-            plan_selective_display_change(&curr, &disabled, true, true, 0, true),
+            plan_selective_display_change(&curr, &disabled, true, true, 0, true, false),
             SelectiveChangeAction::None
         );
     }
