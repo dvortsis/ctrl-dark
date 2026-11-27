@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -19,7 +20,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::autostart;
-use crate::config::{self, AppConfig, HotkeyRuleAction, MonitorHotkeyRule, WakeMode};
+use crate::config::{
+    self, AppConfig, HotkeyRuleAction, MonitorHotkeyRule, ThemePreference, WakeMode,
+};
 use crate::display::ccd::{
     deactivate_targets, force_mode_recommit, has_live_gdi_mode, query_displays, DeactivateResult,
 };
@@ -34,9 +37,10 @@ use crate::display::{
 };
 use crate::hotkey::{self, ParsedHotkey};
 use crate::input_guard::InputGuardHandle;
-use crate::ipc::{DaemonStatus, IpcRequest, IpcResponse};
+use crate::ipc::{DaemonStatus, DisplayOpGuard, IpcRequest, IpcResponse};
 use crate::logging;
 use crate::tray::{TrayManager, TrayMenuData, TrayVisualState};
+use crate::web_server::LaunchUrlMinter;
 use crate::win_util::to_wide_null;
 use crate::window_restore::{capture_windows, SavedWindow};
 
@@ -106,6 +110,16 @@ impl DaemonPhase {
     }
 }
 
+struct QueuedJob {
+    op_id: u64,
+    job: WorkerJob,
+}
+
+struct CompletedJob {
+    op_id: u64,
+    result: WorkerResult,
+}
+
 #[derive(Clone)]
 enum WorkerJob {
     SleepAll {
@@ -122,6 +136,7 @@ enum WorkerJob {
     },
     ApplyFilteredSnapshot {
         filtered_snapshot: TopologySnapshot,
+        expected_keep_keys: Vec<String>,
         config: AppConfig,
         trigger_vk: Option<u16>,
         lock_workstation: bool,
@@ -137,10 +152,19 @@ enum WorkerJob {
 
 #[derive(Debug)]
 pub enum WorkerResult {
-    SleepAllArmed { wake_mode: WakeMode },
-    SelectiveApplied { live_displays: Vec<DisplayInfo> },
+    SleepAllArmed {
+        wake_mode: WakeMode,
+    },
+    SelectiveApplied {
+        live_displays: Vec<DisplayInfo>,
+    },
     SelectiveLockedDpmsFallback,
     SelectiveNeedsFullSleep,
+    LockFailed {
+        message: String,
+        selective_applied: bool,
+        live_displays: Option<Vec<DisplayInfo>>,
+    },
     Failed(String),
     RecoveryFinished(Result<RecoveryReport, String>),
 }
@@ -149,14 +173,18 @@ pub enum WorkerResult {
 pub enum DeferredUiAction {
     Toggle(TargetScope, Option<u16>),
     Off(TargetScope, Option<WakeMode>),
+    PreviewProfile(TargetScope),
     On,
     Recover(bool),
     SetWakeMode(WakeMode),
+    SetTheme(ThemePreference),
     ReloadConfig,
     ApplyConfig {
         config: Box<AppConfig>,
         expected_config: Option<Box<AppConfig>>,
         autostart: Option<bool>,
+        expected_autostart: Option<bool>,
+        deadline: Instant,
         reply: mpsc::SyncSender<Result<DaemonStatus, String>>,
     },
     Shutdown,
@@ -165,12 +193,15 @@ pub enum DeferredUiAction {
 pub struct Controller {
     pub hwnd: usize,
     pub ui_url: Option<String>,
+    launch_minter: Option<LaunchUrlMinter>,
     pub config: AppConfig,
     pub phase: DaemonPhase,
     pub snapshot: Option<TopologySnapshot>,
+    pub operation_rollback_snapshot: Option<TopologySnapshot>,
     pub saved_windows: Vec<SavedWindow>,
     pub disabled_keys: Vec<String>,
     pub last_recovery_summary: Option<String>,
+    pub last_lock_error: Option<String>,
     pub hotkey_warnings: Vec<String>,
     registered_hotkeys: Vec<(i32, ParsedHotkey, TargetScope, HotkeyRuleAction, String)>,
     power_notify: HPOWERNOTIFY,
@@ -186,24 +217,29 @@ pub struct Controller {
     reenforce_attempts_for_hpd: u32,
     wts_registered: bool,
     session_locked: bool,
+    next_op_id: u64,
+    active_op_id: u64,
+    latest_dispatched_op: Arc<AtomicU64>,
+    shutting_down: bool,
     pub tray: Option<TrayManager>,
     pub tray_displays: Vec<DisplayInfo>,
-    worker_tx: Sender<WorkerJob>,
-    worker_res_rx: Receiver<WorkerResult>,
+    worker_tx: Option<Sender<QueuedJob>>,
+    worker_res_rx: Receiver<CompletedJob>,
+    worker_join: Option<thread::JoinHandle<()>>,
     pending_ipc_actions: Vec<DeferredUiAction>,
 }
 
 impl Controller {
     pub fn new(hwnd_raw: usize, config: AppConfig) -> Self {
         let hwnd = hwnd_raw as HWND;
-        let (job_tx, job_rx) = mpsc::channel::<WorkerJob>();
-        let (res_tx, res_rx) = mpsc::channel::<WorkerResult>();
-        let cfg_clone = config.clone();
-        let _ = cfg_clone;
+        let (job_tx, job_rx) = mpsc::channel::<QueuedJob>();
+        let (res_tx, res_rx) = mpsc::channel::<CompletedJob>();
+        let latest_dispatched_op = Arc::new(AtomicU64::new(0));
+        let worker_latest_op = latest_dispatched_op.clone();
 
-        thread::Builder::new()
+        let worker_join = thread::Builder::new()
             .name("display-worker".to_string())
-            .spawn(move || worker_loop(hwnd_raw, job_rx, res_tx))
+            .spawn(move || worker_loop(hwnd_raw, job_rx, res_tx, worker_latest_op))
             .expect("spawn display-worker thread");
 
         let power_notify = unsafe {
@@ -250,12 +286,15 @@ impl Controller {
         let mut ctrl = Self {
             hwnd: hwnd_raw,
             ui_url: None,
+            launch_minter: None,
             config,
             phase: initial_phase,
             snapshot,
+            operation_rollback_snapshot: None,
             saved_windows: Vec::new(),
             disabled_keys: initial_disabled,
             last_recovery_summary: None,
+            last_lock_error: None,
             hotkey_warnings: Vec::new(),
             registered_hotkeys: Vec::new(),
             power_notify,
@@ -271,16 +310,49 @@ impl Controller {
             reenforce_attempts_for_hpd: 0,
             wts_registered,
             session_locked: false,
+            next_op_id: 0,
+            active_op_id: 0,
+            latest_dispatched_op,
+            shutting_down: false,
             tray: Some(tray),
             tray_displays: displays,
-            worker_tx: job_tx,
+            worker_tx: Some(job_tx),
             worker_res_rx: res_rx,
+            worker_join: Some(worker_join),
             pending_ipc_actions: Vec::new(),
         };
 
         ctrl.register_all_hotkeys();
         ctrl.update_tray_visual();
         ctrl
+    }
+
+    pub fn set_launch_minter(&mut self, minter: LaunchUrlMinter) {
+        self.launch_minter = Some(minter);
+    }
+
+    pub fn mint_ui_url(&self) -> Option<String> {
+        self.launch_minter
+            .as_ref()
+            .and_then(|m| m.mint_launch_url().ok())
+            .or_else(|| self.ui_url.clone())
+    }
+
+    pub fn take_worker_join(&mut self) -> Option<thread::JoinHandle<()>> {
+        self.worker_join.take()
+    }
+
+    fn dispatch_worker(&mut self, job: WorkerJob) {
+        if self.shutting_down {
+            return;
+        }
+        self.next_op_id = self.next_op_id.wrapping_add(1).max(1);
+        let op_id = self.next_op_id;
+        self.active_op_id = op_id;
+        self.latest_dispatched_op.store(op_id, Ordering::Release);
+        if let Some(tx) = &self.worker_tx {
+            let _ = tx.send(QueuedJob { op_id, job });
+        }
     }
 
     pub fn register_all_hotkeys(&mut self) {
@@ -422,7 +494,7 @@ impl Controller {
                             .iter()
                             .any(|k| k.eq_ignore_ascii_case(&d.stable_key))
                 });
-                if !any_target_active {
+                if !any_target_active && !scope.is_explicit_keep_layout() {
                     self.trigger_on();
                     return;
                 }
@@ -433,16 +505,32 @@ impl Controller {
         self.trigger_off(scope, None, trigger_vk);
     }
 
+    pub fn trigger_preview(&mut self, scope: TargetScope) {
+        self.trigger_off_with_lock(scope, None, None, false);
+    }
+
     pub fn trigger_off(
         &mut self,
         scope: TargetScope,
         wake_override: Option<WakeMode>,
         trigger_vk: Option<u16>,
     ) {
-        if matches!(
-            self.phase,
-            DaemonPhase::Recovering | DaemonPhase::RecoveryFailed
-        ) {
+        self.trigger_off_with_lock(scope, wake_override, trigger_vk, true);
+    }
+
+    fn trigger_off_with_lock(
+        &mut self,
+        scope: TargetScope,
+        wake_override: Option<WakeMode>,
+        trigger_vk: Option<u16>,
+        allow_lock: bool,
+    ) {
+        if self.shutting_down
+            || matches!(
+                self.phase,
+                DaemonPhase::Recovering | DaemonPhase::RecoveryFailed
+            )
+        {
             return;
         }
         if matches!(
@@ -453,6 +541,7 @@ impl Controller {
             // normal-wake mode swallowing all keyboard and mouse input.
             return;
         }
+        self.last_lock_error = None;
 
         let all_connected: Option<Vec<DisplayInfo>> = if matches!(scope, TargetScope::All) {
             None
@@ -467,7 +556,7 @@ impl Controller {
         };
 
         // Persist the rollback baseline before changing displays when all available
-        // monitors are currently active, so an older background save cannot overwrite a newer snapshot.
+        // monitors are active, preserving any larger multi-monitor dock baseline.
         if self.phase == DaemonPhase::ActiveOn {
             let live_has_inactive = match &all_connected {
                 Some(list) => list.iter().any(|d| !d.active),
@@ -476,13 +565,23 @@ impl Controller {
                     .unwrap_or(false),
             };
             if !live_has_inactive {
-                let _ = self.capture_healthy_state_inner();
+                if let Err(e) = self.capture_pre_action_state() {
+                    if !matches!(scope, TargetScope::All) {
+                        let msg = format!("Pre-action snapshot capture failed: {e}");
+                        logging::error(&msg);
+                        self.last_recovery_summary = Some(format!("Error: {msg}"));
+                        self.show_tray_balloon("Ctrl + Dark", &msg);
+                        return;
+                    }
+                    logging::warn(format!("Pre-sleep snapshot capture warning: {e}"));
+                }
             }
         }
 
+        let lock_workstation = allow_lock && self.config.lock_workstation_on_sleep;
+
         match scope {
             TargetScope::All => {
-                let lock_workstation = self.config.lock_workstation_on_sleep;
                 // Locking switches to Secure Desktop where low-level input hooks cannot run cleanly.
                 let wake_mode = if lock_workstation {
                     WakeMode::AnyInput
@@ -505,7 +604,7 @@ impl Controller {
                 } else {
                     DaemonPhase::SleepingNormal
                 };
-                let _ = self.worker_tx.send(WorkerJob::SleepAll {
+                self.dispatch_worker(WorkerJob::SleepAll {
                     trigger_vk,
                     wake_mode,
                     lock_workstation,
@@ -519,7 +618,7 @@ impl Controller {
             | TargetScope::Profile { .. } => {
                 let all_connected = all_connected.unwrap_or_default();
 
-                let mut plan = plan_selective_off(
+                let plan = plan_selective_off(
                     &self.phase,
                     &all_connected,
                     &scope,
@@ -535,39 +634,66 @@ impl Controller {
                                 .any(|k| k.eq_ignore_ascii_case(&d.stable_key))
                         })
                         .collect();
-                    if let Some(snap) = &self.snapshot {
-                        let filtered = filter_snapshot_for_displays(snap, &keep_displays);
-                        if !filtered.monitors.is_empty() {
-                            let disabled_keys: Vec<String> = all_connected
-                                .iter()
-                                .filter(|d| {
-                                    keep_displays
-                                        .iter()
-                                        .all(|k| !k.stable_key.eq_ignore_ascii_case(&d.stable_key))
-                                })
-                                .map(|d| d.stable_key.clone())
-                                .collect();
-                            self.phase = DaemonPhase::SelectiveOff;
-                            self.disabled_keys = disabled_keys;
-                            self.selective_job_in_flight = true;
-                            let _ = self.worker_tx.send(WorkerJob::ApplyFilteredSnapshot {
-                                filtered_snapshot: filtered,
-                                config: self.config.clone(),
-                                trigger_vk,
-                                lock_workstation: self.config.lock_workstation_on_sleep,
-                            });
-                            self.update_tray_visual();
-                            return;
-                        }
+                    let Some(snap) = &self.snapshot else {
+                        let msg = "Cannot switch layout: capture a full topology snapshot first."
+                            .to_string();
+                        logging::warn(&msg);
+                        self.last_recovery_summary = Some(format!("Error: {msg}"));
+                        self.show_tray_balloon("Ctrl + Dark", &msg);
+                        return;
+                    };
+                    let filtered = filter_snapshot_for_displays(snap, &keep_displays);
+                    if filtered.monitors.len() < keep_displays.len() {
+                        let missing: Vec<&str> = keep_displays
+                            .iter()
+                            .filter(|d| {
+                                !filtered
+                                    .monitors
+                                    .iter()
+                                    .any(|m| m.stable_key.eq_ignore_ascii_case(&d.stable_key))
+                            })
+                            .map(|d| d.friendly_name.as_str())
+                            .collect();
+                        let msg = format!(
+                            "Cannot switch layout: connected display(s) [{}] are absent from the saved snapshot. Wake All and Capture Snapshot first.",
+                            missing.join(", ")
+                        );
+                        logging::warn(&msg);
+                        self.last_recovery_summary = Some(format!("Error: {msg}"));
+                        self.show_tray_balloon("Ctrl + Dark", &msg);
+                        return;
                     }
-                    // Fall back to additive deactivation if the saved snapshot cannot satisfy the keep layout.
-                    plan =
-                        plan_selective_off(&DaemonPhase::ActiveOn, &all_connected, &scope, false);
+                    let disabled_keys: Vec<String> = all_connected
+                        .iter()
+                        .filter(|d| {
+                            keep_displays
+                                .iter()
+                                .all(|k| !k.stable_key.eq_ignore_ascii_case(&d.stable_key))
+                        })
+                        .map(|d| d.stable_key.clone())
+                        .collect();
+                    self.phase = DaemonPhase::SelectiveOff;
+                    self.disabled_keys = disabled_keys;
+                    self.selective_job_in_flight = true;
+                    self.dispatch_worker(WorkerJob::ApplyFilteredSnapshot {
+                        filtered_snapshot: filtered,
+                        expected_keep_keys: keep_keys.clone(),
+                        config: self.config.clone(),
+                        trigger_vk,
+                        lock_workstation,
+                    });
+                    self.update_tray_visual();
+                    return;
                 }
 
                 match plan {
                     SelectiveOffPlan::SleepAll => {
-                        self.trigger_off(TargetScope::All, wake_override, trigger_vk);
+                        self.trigger_off_with_lock(
+                            TargetScope::All,
+                            wake_override,
+                            trigger_vk,
+                            allow_lock,
+                        );
                     }
                     SelectiveOffPlan::DeactivateActive(keys) => {
                         self.phase = DaemonPhase::SelectiveOff;
@@ -578,14 +704,23 @@ impl Controller {
                         }
                         let target_names = describe_keys(&all_connected, &keys);
                         self.selective_job_in_flight = true;
-                        let _ = self.worker_tx.send(WorkerJob::DeactivateSelective {
+                        self.dispatch_worker(WorkerJob::DeactivateSelective {
                             target_keys: keys,
                             target_names,
                             trigger_vk,
-                            lock_workstation: self.config.lock_workstation_on_sleep,
+                            lock_workstation,
                             fallback_dpms_on_access_denied: false,
                         });
                         self.update_tray_visual();
+                    }
+                    SelectiveOffPlan::UnmatchedKeep(off_names) => {
+                        let msg = format!(
+                            "Keep profile matched no connected displays (would turn off {}). Edit the profile or reconnect the display.",
+                            describe_keys(&all_connected, &off_names)
+                        );
+                        logging::warn(&msg);
+                        self.last_recovery_summary = Some(format!("Error: {msg}"));
+                        self.show_tray_balloon("Ctrl + Dark", &msg);
                     }
                     SelectiveOffPlan::NoOp | SelectiveOffPlan::ApplyFilteredKeep(_) => {
                         logging::warn(format!("No active display matched scope {scope:?}"));
@@ -610,7 +745,7 @@ impl Controller {
 
     fn trigger_recover_with_context(&mut self, hard: bool, from_session_unlock: bool) {
         self.disarm_input_guard();
-        if self.phase == DaemonPhase::Recovering {
+        if self.shutting_down || self.phase == DaemonPhase::Recovering {
             return;
         }
         let was_selective_off = self.phase == DaemonPhase::SelectiveOff;
@@ -628,10 +763,14 @@ impl Controller {
         } else {
             RecoveryLevel::Standard
         };
-        let _ = self.worker_tx.send(WorkerJob::Recover {
+        let rollback_snapshot = self
+            .snapshot
+            .clone()
+            .or_else(|| self.operation_rollback_snapshot.clone());
+        self.dispatch_worker(WorkerJob::Recover {
             level,
             config: self.config.clone(),
-            snapshot: self.snapshot.clone(),
+            snapshot: rollback_snapshot,
             saved_windows: self.saved_windows.clone(),
             wake_ctx: WakeContext {
                 was_selective_off,
@@ -643,8 +782,15 @@ impl Controller {
     }
 
     pub fn on_worker_done(&mut self) {
-        while let Ok(res) = self.worker_res_rx.try_recv() {
-            match res {
+        while let Ok(completed) = self.worker_res_rx.try_recv() {
+            if !should_apply_completion(completed.op_id, self.active_op_id) {
+                logging::info(format!(
+                    "Ignoring stale worker completion (op_id={}, active_op_id={})",
+                    completed.op_id, self.active_op_id
+                ));
+                continue;
+            }
+            match completed.result {
                 WorkerResult::Failed(error) => {
                     logging::error(&error);
                     self.selective_job_in_flight = false;
@@ -664,11 +810,36 @@ impl Controller {
                         self.update_tray_visual();
                     }
                 }
+                WorkerResult::LockFailed {
+                    message,
+                    selective_applied,
+                    live_displays,
+                } => {
+                    logging::error(&message);
+                    self.selective_job_in_flight = false;
+                    self.last_lock_error = Some(message.clone());
+                    self.show_tray_balloon("Ctrl + Dark — Workstation Lock Failed", &message);
+                    if !selective_applied {
+                        self.disarm_input_guard();
+                        self.phase = DaemonPhase::ActiveOn;
+                    } else if let Some(live) = live_displays {
+                        self.disabled_keys = reconcile_disabled_keys(&self.disabled_keys, &live);
+                        self.phase = if self.disabled_keys.is_empty() {
+                            DaemonPhase::ActiveOn
+                        } else {
+                            DaemonPhase::SelectiveOff
+                        };
+                        self.tray_displays = live;
+                    }
+                    self.update_tray_visual();
+                }
                 WorkerResult::SleepAllArmed { wake_mode } => {
+                    self.last_lock_error = None;
                     logging::info(format!("Monitors entered sleep ({wake_mode:?})"));
                 }
                 WorkerResult::SelectiveApplied { live_displays } => {
                     self.selective_job_in_flight = false;
+                    self.last_lock_error = None;
                     let in_hpd_window = self
                         .last_hpd_change_at
                         .is_some_and(|t| t.elapsed() <= HPD_ENFORCE_WINDOW);
@@ -716,6 +887,7 @@ impl Controller {
                 }
                 WorkerResult::RecoveryFinished(outcome) => {
                     self.selective_job_in_flight = false;
+                    self.last_lock_error = None;
                     let failed = outcome.is_err();
                     match outcome {
                         Ok(report) => {
@@ -853,7 +1025,7 @@ impl Controller {
                             "Re-applying selective off on session unlock after locked-session hot-plug [{names}]"
                         ));
                         self.selective_job_in_flight = true;
-                        let _ = self.worker_tx.send(WorkerJob::DeactivateSelective {
+                        self.dispatch_worker(WorkerJob::DeactivateSelective {
                             target_keys: reactivated,
                             target_names: names,
                             trigger_vk: None,
@@ -957,7 +1129,7 @@ impl Controller {
                     self.selective_job_in_flight = true;
                     self.last_reenforce_at = Some(Instant::now());
                     self.reenforce_attempts_for_hpd += 1;
-                    let _ = self.worker_tx.send(WorkerJob::DeactivateSelective {
+                    self.dispatch_worker(WorkerJob::DeactivateSelective {
                         target_keys: keys,
                         target_names: names,
                         trigger_vk: None,
@@ -1006,6 +1178,7 @@ impl Controller {
                     .into(),
             );
         }
+        let _op_guard = DisplayOpGuard::try_acquire(2000)?;
         self.capture_healthy_state_inner()
     }
 
@@ -1015,15 +1188,30 @@ impl Controller {
         let snap = capture_active_snapshot()?;
         let count = snap.monitors.len();
         save_snapshot_atomic(&snap, &config::snapshot_path())?;
+        self.operation_rollback_snapshot = Some(snap.clone());
         self.snapshot = Some(snap);
         self.tray_displays = live_displays;
         Ok(count)
     }
 
+    fn capture_pre_action_state(&mut self) -> Result<(), String> {
+        let live_displays = query_displays(false)?;
+        let live_snap = capture_active_snapshot()?;
+        self.saved_windows = capture_windows(&live_displays);
+        self.operation_rollback_snapshot = Some(live_snap.clone());
+        if should_replace_durable_snapshot(self.snapshot.as_ref(), &live_snap) {
+            save_snapshot_atomic(&live_snap, &config::snapshot_path())?;
+            self.snapshot = Some(live_snap);
+        }
+        self.tray_displays = live_displays;
+        Ok(())
+    }
+
     pub fn handle_menu_command(&mut self, cmd_id: usize) {
         match cmd_id {
             crate::tray::MENU_OPEN_UI => {
-                if let Err(e) = autostart::launch_ui_window(self.ui_url.as_deref(), false) {
+                let url = self.mint_ui_url();
+                if let Err(e) = autostart::launch_ui_window(url.as_deref(), false) {
                     logging::warn(format!("Failed launching Control Panel: {e}"));
                 }
             }
@@ -1150,6 +1338,7 @@ impl Controller {
             match act {
                 DeferredUiAction::Toggle(scope, vk) => self.trigger_toggle(scope, vk),
                 DeferredUiAction::Off(scope, mode) => self.trigger_off(scope, mode, None),
+                DeferredUiAction::PreviewProfile(scope) => self.trigger_preview(scope),
                 DeferredUiAction::On => self.trigger_on(),
                 DeferredUiAction::Recover(hard) => self.trigger_recover(hard),
                 DeferredUiAction::SetWakeMode(mode) => {
@@ -1157,13 +1346,28 @@ impl Controller {
                     let _ = self.config.save();
                     self.update_tray_visual();
                 }
+                DeferredUiAction::SetTheme(theme) => {
+                    self.config.theme = theme;
+                    if let Err(e) = self.config.save() {
+                        logging::warn(format!("Failed saving appearance theme: {e}"));
+                    }
+                }
                 DeferredUiAction::ReloadConfig => self.reload_config(),
                 DeferredUiAction::ApplyConfig {
                     config,
                     expected_config,
                     autostart,
+                    expected_autostart,
+                    deadline,
                     reply,
                 } => {
+                    if Instant::now() > deadline {
+                        let _ = reply.send(Err(
+                            "Configuration save expired after HTTP timeout. Refresh before saving again."
+                                .into(),
+                        ));
+                        continue;
+                    }
                     let mut current = self.config.clone();
                     current.hotkeys.monitor_hotkeys = current
                         .hotkeys
@@ -1174,6 +1378,15 @@ impl Controller {
                     if expected_config.is_some_and(|expected| *expected != current) {
                         let _ = reply.send(Err("Settings changed since editing began. Refresh and reopen the editor before saving.".into()));
                         continue;
+                    }
+                    if autostart.is_some() {
+                        if let Some(exp_auto) = expected_autostart {
+                            let live_auto = autostart::is_enabled().ok().flatten().is_some();
+                            if live_auto != exp_auto {
+                                let _ = reply.send(Err("Autostart changed since editing began. Refresh and reopen the editor before saving.".into()));
+                                continue;
+                            }
+                        }
                     }
                     let res = self.apply_config_now(*config, autostart);
                     let _ = reply.send(res);
@@ -1203,10 +1416,18 @@ impl Controller {
                     .map_err(|e| format!("Settings saved, but disabling autostart failed: {e}"))?;
             }
         }
-        Ok(self.build_status())
+        Ok(self.build_status_for_http())
     }
 
     pub fn build_status(&self) -> DaemonStatus {
+        self.build_status_inner(true)
+    }
+
+    pub fn build_status_for_http(&self) -> DaemonStatus {
+        self.build_status_inner(false)
+    }
+
+    fn build_status_inner(&self, mint_launch: bool) -> DaemonStatus {
         let live = query_displays(true).unwrap_or_default();
         let active_count = live.iter().filter(|d| d.active).count();
         let avail_count = live.iter().filter(|d| d.available).count();
@@ -1245,7 +1466,12 @@ impl Controller {
             disabled_monitors: self.disabled_keys.clone(),
             hotkey_warnings: self.hotkey_warnings.clone(),
             last_recovery_summary: self.last_recovery_summary.clone(),
-            ui_url: self.ui_url.clone(),
+            last_lock_error: self.last_lock_error.clone(),
+            ui_url: if mint_launch {
+                self.mint_ui_url()
+            } else {
+                None
+            },
         }
     }
 
@@ -1300,6 +1526,7 @@ impl Controller {
     }
 
     pub fn shutdown(&mut self) {
+        self.shutting_down = true;
         self.disarm_input_guard();
         self.unregister_all_hotkeys();
         unsafe {
@@ -1317,6 +1544,8 @@ impl Controller {
             }
             self.wts_registered = false;
         }
+        // Close worker channel so an active hard bounce/restore finishes cleanly before exit.
+        self.worker_tx.take();
         self.tray.take();
         unsafe {
             PostQuitMessage(0);
@@ -1474,7 +1703,22 @@ enum SelectiveOffPlan {
     SleepAll,
     ApplyFilteredKeep(Vec<String>),
     DeactivateActive(Vec<String>),
+    UnmatchedKeep(Vec<String>),
     NoOp,
+}
+
+fn should_apply_completion(completed_op_id: u64, active_op_id: u64) -> bool {
+    completed_op_id == active_op_id
+}
+
+fn should_replace_durable_snapshot(
+    prev_durable: Option<&TopologySnapshot>,
+    live_snap: &TopologySnapshot,
+) -> bool {
+    match prev_durable {
+        None => true,
+        Some(prev) => live_snap.monitors.len() >= prev.monitors.len(),
+    }
 }
 
 fn plan_selective_off(
@@ -1485,6 +1729,9 @@ fn plan_selective_off(
 ) -> SelectiveOffPlan {
     let off_keys = resolve_scope_keys(all_connected, scope);
     if !all_connected.is_empty() && off_keys.len() >= all_connected.len() {
+        if scope.is_explicit_keep_layout() {
+            return SelectiveOffPlan::UnmatchedKeep(off_keys);
+        }
         return SelectiveOffPlan::SleepAll;
     }
 
@@ -1496,6 +1743,9 @@ fn plan_selective_off(
                 .any(|k| k.eq_ignore_ascii_case(&d.stable_key))
         })
         .collect();
+    if scope.is_explicit_keep_layout() && keep_displays.is_empty() && !all_connected.is_empty() {
+        return SelectiveOffPlan::UnmatchedKeep(off_keys);
+    }
     if scope.is_explicit_keep_layout()
         && *phase == DaemonPhase::SelectiveOff
         && has_snapshot
@@ -1803,18 +2053,28 @@ fn should_wake_on_session_unlock(wake_on_unlock: bool, phase: &DaemonPhase) -> b
     wake_on_unlock && !matches!(phase, DaemonPhase::Recovering)
 }
 
-fn lock_workstation_after_action(trigger_vk: Option<u16>, action_desc: &str) {
+fn lock_workstation_after_action(trigger_vk: Option<u16>, action_desc: &str) -> bool {
     hotkey::wait_for_keys_released(trigger_vk, 800, 0);
     if unsafe { LockWorkStation() } != 0 {
         logging::info(format!("Locked workstation {action_desc}"));
+        true
     } else {
         logging::warn(format!("LockWorkStation failed {action_desc}"));
+        false
     }
 }
 
-fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult>) {
-    while let Ok(job) = rx.recv() {
-        let result = match job {
+fn worker_loop(
+    hwnd_raw: usize,
+    rx: Receiver<QueuedJob>,
+    tx: Sender<CompletedJob>,
+    latest_op: Arc<AtomicU64>,
+) {
+    while let Ok(queued) = rx.recv() {
+        if queued.op_id != latest_op.load(Ordering::Acquire) {
+            continue;
+        }
+        let result = match queued.job {
             WorkerJob::SleepAll {
                 trigger_vk,
                 wake_mode,
@@ -1822,17 +2082,26 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
             } => {
                 hotkey::wait_for_keys_released(trigger_vk, 800, 80);
                 if lock_workstation {
-                    let locked = unsafe { LockWorkStation() } != 0;
-                    if locked {
+                    if unsafe { LockWorkStation() } != 0 {
                         logging::info("Locked workstation prior to monitor sleep");
+                        // Give Winlogon time to switch to Secure Desktop before powering off displays.
+                        thread::sleep(Duration::from_millis(500));
+                        send_monitors_off_power(Some(hwnd_raw));
+                        WorkerResult::SleepAllArmed { wake_mode }
                     } else {
-                        logging::warn("LockWorkStation failed before monitor sleep");
+                        logging::warn(
+                            "LockWorkStation failed before monitor sleep; aborting blank",
+                        );
+                        WorkerResult::LockFailed {
+                            message: "Windows rejected the workstation lock request, so monitors were kept on.".into(),
+                            selective_applied: false,
+                            live_displays: None,
+                        }
                     }
-                    // Give Winlogon time to switch to Secure Desktop before powering off displays.
-                    thread::sleep(Duration::from_millis(500));
+                } else {
+                    send_monitors_off_power(Some(hwnd_raw));
+                    WorkerResult::SleepAllArmed { wake_mode }
                 }
-                send_monitors_off_power(Some(hwnd_raw));
-                WorkerResult::SleepAllArmed { wake_mode }
             }
             WorkerJob::DeactivateSelective {
                 target_keys,
@@ -1841,6 +2110,7 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
                 lock_workstation,
                 fallback_dpms_on_access_denied,
             } => {
+                let _op_guard = DisplayOpGuard::try_acquire(2000).ok();
                 let t = Instant::now();
                 match deactivate_targets(&target_keys) {
                     Ok(DeactivateResult::WouldDisableAll) => {
@@ -1860,13 +2130,20 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
                         logging::info(format!(
                             "Selective off deactivated {n} display(s) in {ms}ms [targets: {target_names}]"
                         ));
-                        if lock_workstation {
-                            lock_workstation_after_action(
+                        if lock_workstation
+                            && !lock_workstation_after_action(
                                 trigger_vk,
                                 "after selective monitor off",
-                            );
+                            )
+                        {
+                            WorkerResult::LockFailed {
+                                message: "Monitors changed selectively, but Windows rejected locking the workstation.".into(),
+                                selective_applied: true,
+                                live_displays: Some(live_displays),
+                            }
+                        } else {
+                            WorkerResult::SelectiveApplied { live_displays }
                         }
-                        WorkerResult::SelectiveApplied { live_displays }
                     }
                     Ok(DeactivateResult::NothingMatched) => WorkerResult::Failed(
                         "No active display matched the requested selection".into(),
@@ -1883,10 +2160,12 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
             }
             WorkerJob::ApplyFilteredSnapshot {
                 filtered_snapshot,
+                expected_keep_keys,
                 config,
                 trigger_vk,
                 lock_workstation,
             } => {
+                let _op_guard = DisplayOpGuard::try_acquire(2000).ok();
                 let t = Instant::now();
                 match apply_snapshot(&filtered_snapshot, false) {
                     Err(e) => WorkerResult::Failed(format!("ApplyFilteredSnapshot failed: {e}")),
@@ -1911,7 +2190,12 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
                         let live_after = query_displays(true).unwrap_or_default();
                         let active_after: Vec<&DisplayInfo> =
                             live_after.iter().filter(|d| d.active).collect();
-                        let verified = outcome.restored_keys.iter().all(|k| {
+                        let required_keys = if expected_keep_keys.is_empty() {
+                            &outcome.restored_keys
+                        } else {
+                            &expected_keep_keys
+                        };
+                        let verified = required_keys.iter().all(|k| {
                             active_after
                                 .iter()
                                 .any(|d| d.stable_key.eq_ignore_ascii_case(k))
@@ -1928,14 +2212,21 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
                                 outcome.restored_keys.len(),
                                 outcome.used_relaxed_timings,
                             ));
-                            if lock_workstation {
-                                lock_workstation_after_action(
+                            if lock_workstation
+                                && !lock_workstation_after_action(
                                     trigger_vk,
                                     "after applying selective profile",
-                                );
-                            }
-                            WorkerResult::SelectiveApplied {
-                                live_displays: live_after,
+                                )
+                            {
+                                WorkerResult::LockFailed {
+                                    message: "Layout switched, but Windows rejected locking the workstation.".into(),
+                                    selective_applied: true,
+                                    live_displays: Some(live_after),
+                                }
+                            } else {
+                                WorkerResult::SelectiveApplied {
+                                    live_displays: live_after,
+                                }
                             }
                         }
                     }
@@ -1948,6 +2239,7 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
                 saved_windows,
                 wake_ctx,
             } => {
+                let _op_guard = DisplayOpGuard::try_acquire(2000).ok();
                 let res = run_recovery(
                     level,
                     &config,
@@ -1960,7 +2252,10 @@ fn worker_loop(hwnd_raw: usize, rx: Receiver<WorkerJob>, tx: Sender<WorkerResult
             }
         };
 
-        let _ = tx.send(result);
+        let _ = tx.send(CompletedJob {
+            op_id: queued.op_id,
+            result,
+        });
         unsafe {
             PostMessageW(hwnd_raw as HWND, WM_APP_WORKER_DONE, 0, 0);
         }
@@ -2499,6 +2794,102 @@ mod tests {
         assert!(!should_wake_on_session_unlock(
             true,
             &DaemonPhase::Recovering
+        ));
+    }
+
+    #[test]
+    fn stale_worker_completion_is_ignored_after_newer_dispatch() {
+        assert!(!should_apply_completion(1, 2));
+        assert!(should_apply_completion(2, 2));
+    }
+
+    #[test]
+    fn undocked_sleep_preserves_larger_dock_baseline() {
+        let dock = TopologySnapshot {
+            captured_at_unix_ms: 1,
+            monitors: vec![
+                SavedMonitorMode {
+                    stable_key: "a".into(),
+                    friendly_name: "A".into(),
+                    role: DisplayRole::Internal,
+                    edid_mfg: 0,
+                    edid_product: 0,
+                    preferred_source_id: 0,
+                    source_group: None,
+                    position_x: 0,
+                    position_y: 0,
+                    width: 1920,
+                    height: 1080,
+                    pixel_format: 3,
+                    rotation: 1,
+                    scaling: 1,
+                    refresh_num: 60,
+                    refresh_den: 1,
+                    scanline_ordering: 1,
+                    target_video_signal: None,
+                },
+                SavedMonitorMode {
+                    stable_key: "b".into(),
+                    friendly_name: "B".into(),
+                    role: DisplayRole::External,
+                    edid_mfg: 0,
+                    edid_product: 0,
+                    preferred_source_id: 0,
+                    source_group: None,
+                    position_x: 1920,
+                    position_y: 0,
+                    width: 2560,
+                    height: 1440,
+                    pixel_format: 3,
+                    rotation: 1,
+                    scaling: 1,
+                    refresh_num: 60,
+                    refresh_den: 1,
+                    scanline_ordering: 1,
+                    target_video_signal: None,
+                },
+            ],
+        };
+        let undocked = TopologySnapshot {
+            captured_at_unix_ms: 2,
+            monitors: vec![dock.monitors[0].clone()],
+        };
+        assert!(!should_replace_durable_snapshot(Some(&dock), &undocked));
+        assert!(should_replace_durable_snapshot(Some(&undocked), &dock));
+        assert!(should_replace_durable_snapshot(None, &undocked));
+    }
+
+    #[test]
+    fn unmatched_keep_profile_never_sleeps_all_displays() {
+        let connected = vec![
+            make_disp("display#other#1", "Other 1", DisplayRole::External, true),
+            make_disp("display#int#2", "Internal", DisplayRole::Internal, true),
+        ];
+        let profile = TargetScope::Profile {
+            include: vec!["P27h-20".into(), "J560T09".into()],
+            exclude: Vec::new(),
+        };
+        assert!(matches!(
+            plan_selective_off(&DaemonPhase::ActiveOn, &connected, &profile, true),
+            SelectiveOffPlan::UnmatchedKeep(_)
+        ));
+    }
+
+    #[test]
+    fn toggling_unsatisfied_keep_profile_routes_to_apply_filtered_keep() {
+        let displays = vec![
+            make_disp("display#a#1", "A", DisplayRole::External, true),
+            make_disp("display#b#2", "B", DisplayRole::External, false),
+            make_disp("display#c#3", "C", DisplayRole::Internal, false),
+        ];
+        let scope = TargetScope::Profile {
+            include: vec!["A".into(), "B".into()],
+            exclude: vec!["C".into()],
+        };
+        assert!(!is_scope_satisfied_in_selective_off(&displays, &scope));
+        assert!(matches!(
+            plan_selective_off(&DaemonPhase::SelectiveOff, &displays, &scope, true),
+            SelectiveOffPlan::ApplyFilteredKeep(_)
         ));
     }
 }

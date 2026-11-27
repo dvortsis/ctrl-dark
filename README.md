@@ -119,7 +119,6 @@ To build Ctrl + Dark, capture your baseline display layout, and start the tray d
 |---|---|
 | `Ctrl+Alt+M` | Toggle **all** monitors off or wake and recover all monitors. |
 | `Ctrl+Alt+E` | Toggle **external** monitors only (keeps your internal laptop display active). |
-| `Ctrl+Alt+D` | Toggle the starter custom configuration **Only P27h-20 & J560T09** (`include = ["P27h-20", "J560T09"]`). |
 | `Ctrl+Alt+Shift+M` | **Force Recover Displays** from any state, even when screens are black, including external link bounces. |
 | `Esc` × 3 *(within 2 s)* | Emergency hardware unlock while **Stay off until hotkey** (`hotkey_only`) lock mode is armed. |
 
@@ -177,15 +176,15 @@ Select the full-sleep mode in the Control Panel under **Full-sleep wake behavior
 
 Configure Windows lock and unlock automation as two independent options in the Control Panel, the system tray right-click menu, or `config.toml`:
 
-- **Lock computer when turning off monitors** (`lock_workstation_on_sleep`): Calls Windows `LockWorkStation` when turning off monitors via full sleep or selective-off profiles and toggles (automatic hot-plug re-disables do not re-lock). Input locking (`hotkey_only`) stands down during session lock so the Windows sign-in screen accepts your password or PIN.
+- **Lock computer when turning off monitors** (`lock_workstation_on_sleep`): Calls Windows `LockWorkStation` when turning off monitors via full sleep or selective-off profiles and toggles (automatic hot-plug re-disables do not re-lock). If Windows rejects the lock call during full sleep, blanking aborts and raises an alert instead of darkening screens while unlocked. Input locking (`hotkey_only`) stands down during session lock so the Windows sign-in screen accepts your password or PIN.
 - **Turn monitors back on when unlocking Windows** (`wake_on_session_unlock`): Subscribes to Windows session unlock notifications (`WTS_SESSION_UNLOCK`) and wakes or restores all displays with full topology recovery when you unlock Windows from full sleep or `SelectiveOff`. While locked, display change and wake recovery handlers stay paused so background lock-screen events cannot disrupt the sign-in screen.
 
 Both toggles act independently. Enable either option alone or together from **Startup & display recovery options** or the tray items **Lock Computer When Turning Off Monitors** and **Turn Monitors On When Unlocking**.
 
 ### Local-only IPC and Control Panel isolation
 
-- **Loopback HTTP server:** Binds strictly to `127.0.0.1:0`, checks `Host` and `Origin` headers on every request, enforces strict Content Security Policy headers, and requires a per-session 256-bit random token (`X-MT-Token` header for API calls; `mt_csrf` `SameSite=Strict` `HttpOnly` cookie for page loads).
-- **Local Named Pipe IPC:** Listens on `\\.\pipe\monitor-toggle-v1` with `PIPE_REJECT_REMOTE_CLIENTS` and bounded timeouts.
+- **Loopback HTTP server & one-time session bootstrap:** Binds strictly to `127.0.0.1:0`, checks `Host` and `Origin` headers on every request, enforces strict Content Security Policy headers, uses a single-use `?launch=` URL credential exchange to store a per-session 256-bit random token in origin-scoped `sessionStorage` (`X-MT-Token` header for API calls; `?launch=` is stripped from the address bar via `history.replaceState`, with no host-wide cookies), and restricts native WebView navigation to the daemon's exact loopback origin.
+- **Session- & user-scoped Named Pipe IPC:** Listens on `\\.\pipe\monitor-toggle-v1-s<session>-<sid>` with an owner-only SDDL security descriptor, `FILE_FLAG_FIRST_PIPE_INSTANCE`, `PIPE_REJECT_REMOTE_CLIENTS`, client `SECURITY_IDENTIFICATION` flags, server SID verification, and bounded timeouts.
 - **No external telemetry or network calls:** Ctrl + Dark never connects outside `127.0.0.1`.
 
 > [!WARNING]
@@ -213,13 +212,14 @@ All persistent settings live in `%APPDATA%\monitor-toggle\config.toml`. You can 
 | Setting | What it does | Recommended / Default | Notes |
 |---|---|---|---|
 | `start_minimized_to_tray` | Hides the Control Panel window when launching `CtrlDark.exe` cold | `true` | Pass `CtrlDark.exe --open` to force the window open. |
+| `theme` | Persists the Control Panel color theme (`"system"`, `"light"`, or `"dark"`) | `"system"` | Updated from the Control Panel appearance selector via `set_theme`. |
 | `wake_mode` | Controls input locking while all monitors sleep | `"hotkey_only"` | Alternatives: `"any_input"`. `Esc` × 3 unlocks `hotkey_only`. |
 | `lock_workstation_on_sleep` | Locks Windows (`LockWorkStation`) when turning off monitors (full sleep or selective off) | `false` | Independent of `wake_on_session_unlock`. Excluded on automatic hot-plug re-disables. |
 | `wake_on_session_unlock` | Wakes/restores displays and runs recovery on `WTS_SESSION_UNLOCK` | `false` | Independent of `lock_workstation_on_sleep`. Works from full sleep and `SelectiveOff`. |
 | `hotkeys.toggle_all` | Global hotkey to toggle all displays off/on | `"Ctrl+Alt+M"` | Set `""` to disable the global hotkey. |
 | `hotkeys.toggle_externals` | Global hotkey to toggle external/USB displays only | `"Ctrl+Alt+E"` | Keeps the internal panel ON. |
 | `hotkeys.force_recover` | Blind force-recover and external path bounce hotkey | `"Ctrl+Alt+Shift+M"` | Works even when monitors stay black. |
-| `hotkeys.monitor_hotkeys` | List of custom layout profiles (`hotkey`, `label`, `include`, `exclude`, `action`) | Starter `Only P27h-20 & J560T09` | `action` is `"toggle"` or `"off"`. Empty `hotkey` creates a tray-only profile. |
+| `hotkeys.monitor_hotkeys` | List of custom layout profiles (`hotkey`, `label`, `include`, `exclude`, `action`) | `[]` | `action` is `"toggle"` or `"off"`. Empty `hotkey` creates a tray-only profile. |
 | `recovery.settle_timeout_ms` | Max wait for HPD targets before restoring topology (`0–30000`) | `4000` | Automatically uses `0 ms` on healthy `SelectiveOff` wakes when the console stayed on. |
 | `recovery.retrain_usb_displays_on_wake` | Re-commits DisplayLink / `UsbIndirect` monitors on wake when live GDI scanout is missing | `true` | Skipped when GDI scanout is already live during `Standard` wakes. |
 | `recovery.ddc_assist` | Sends bounded DDC/CI VCP `0xD6 = 0x01` wake commands to external monitors | `true` | Shared `750 ms` batch budget; at most 8 stalled workers capped. |
@@ -236,6 +236,8 @@ All persistent settings live in `%APPDATA%\monitor-toggle\config.toml`. You can 
 # monitor-toggle configuration
 # Start minimized to the system tray (hide the Control Panel window on cold launch)
 start_minimized_to_tray = true
+# Control Panel appearance: "system", "light", or "dark"
+theme = "system"
 # Supported wake modes:
 #   "hotkey_only" - Ignore mouse bumps & stray keys while toggled off (press Esc 3x as failsafe)
 #   "any_input"   - Normal DPMS sleep (any mouse/key or hotkey wakes & recovers displays)
@@ -255,11 +257,11 @@ force_recover = "Ctrl+Alt+Shift+M"
 
 # Optional per-monitor configurations / hotkeys.
 # Use `include` to keep selected displays ON, and/or `exclude` to turn selected displays OFF.
-[[hotkeys.monitor_hotkeys]]
-hotkey = "Ctrl+Alt+D"
-label = "Only P27h-20 & J560T09"
-include = ["P27h-20", "J560T09"]
-action = "toggle"
+# [[hotkeys.monitor_hotkeys]]
+# hotkey = "Ctrl+Alt+2"
+# label = "Desk Focus"
+# include = ["Monitor A", "Monitor B"]
+# action = "toggle"
 
 [recovery]
 settle_timeout_ms = 4000
@@ -382,7 +384,7 @@ npm test
 
 If a running `monitor-toggled.exe` locks release executables during a rebuild, stop it first (`.\target\release\monitor-toggle.exe daemon stop`) or build to an alternate target directory (`cargo build --release --locked --target-dir target\review-release`).
 
-For implementation history and hardware notes, see [REVIEW.md](docs/REVIEW.md), [REVIEW-2.md](docs/REVIEW-2.md), [REVIEW-3.md](docs/REVIEW-3.md), and [REVIEW-4.md](docs/REVIEW-4.md).
+For implementation history and hardware notes, see [REVIEW.md](docs/REVIEW.md), [REVIEW-2.md](docs/REVIEW-2.md), [REVIEW-3.md](docs/REVIEW-3.md), [REVIEW-4.md](docs/REVIEW-4.md), and [REVIEW-5.md](docs/REVIEW-5.md).
 
 ---
 

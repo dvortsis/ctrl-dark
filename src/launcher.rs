@@ -18,7 +18,7 @@ use windows_sys::Win32::System::Registry::{
 
 use crate::autostart;
 use crate::config::{self, AppConfig};
-use crate::ipc::{send_request, IpcRequest, IpcResponse};
+use crate::ipc::{send_request, validate_loopback_ui_url, IpcRequest, IpcResponse};
 use crate::win_util::{from_wide_slice, to_wide_null, write_atomic};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -108,14 +108,26 @@ pub fn resolve_launcher_exe_path() -> Result<PathBuf, String> {
 }
 
 /// Ensures `monitor-toggled.exe` is running and returns `(was_already_running, ui_url)`.
+/// Pass `require_ui_url = false` for non-UI commands so pipe IPC does not wait on HTTP startup.
 pub fn ensure_daemon_running(notify_tray: bool) -> Result<(bool, Option<String>), String> {
+    ensure_daemon_running_with_options(notify_tray, true)
+}
+
+pub fn ensure_daemon_running_with_options(
+    notify_tray: bool,
+    require_ui_url: bool,
+) -> Result<(bool, Option<String>), String> {
     let mut was_running = false;
     if let Ok(IpcResponse::Ok {
         status: Some(st), ..
     }) = send_request(&IpcRequest::Status, 250)
     {
-        if st.ui_url.is_some() {
-            return Ok((true, st.ui_url));
+        let validated = st
+            .ui_url
+            .as_deref()
+            .and_then(|u| validate_loopback_ui_url(u).ok());
+        if !require_ui_url || validated.is_some() {
+            return Ok((true, validated));
         }
         was_running = true;
     }
@@ -152,8 +164,12 @@ pub fn ensure_daemon_running(notify_tray: bool) -> Result<(bool, Option<String>)
             status: Some(st), ..
         }) = send_request(&IpcRequest::Status, 300)
         {
-            if st.ui_url.is_some() {
-                return Ok((was_running, st.ui_url));
+            let validated = st
+                .ui_url
+                .as_deref()
+                .and_then(|u| validate_loopback_ui_url(u).ok());
+            if !require_ui_url || validated.is_some() {
+                return Ok((was_running, validated));
             }
         }
         thread::sleep(Duration::from_millis(60));
@@ -168,7 +184,12 @@ pub fn execute_launch(opts: &LaunchOptions) -> Result<LaunchAction, String> {
     let (was_running, initial_url) = match send_request(&IpcRequest::Status, 250) {
         Ok(IpcResponse::Ok {
             status: Some(st), ..
-        }) => (true, st.ui_url),
+        }) => (
+            true,
+            st.ui_url
+                .as_deref()
+                .and_then(|u| validate_loopback_ui_url(u).ok()),
+        ),
         _ => (false, None),
     };
 
@@ -176,7 +197,7 @@ pub fn execute_launch(opts: &LaunchOptions) -> Result<LaunchAction, String> {
     let ui_url = match action {
         LaunchAction::StayInTray { notify } => {
             if !was_running {
-                let (_, url) = ensure_daemon_running(notify)?;
+                let (_, url) = ensure_daemon_running_with_options(notify, false)?;
                 url
             } else {
                 initial_url
@@ -186,7 +207,7 @@ pub fn execute_launch(opts: &LaunchOptions) -> Result<LaunchAction, String> {
             let url = if was_running && initial_url.is_some() {
                 initial_url
             } else {
-                let (_, url) = ensure_daemon_running(false)?;
+                let (_, url) = ensure_daemon_running_with_options(false, true)?;
                 url
             };
             autostart::launch_ui_window(url.as_deref(), browser)?;

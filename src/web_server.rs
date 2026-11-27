@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::autostart;
-use crate::config::{AppConfig, HotkeyRuleAction, MonitorHotkeyRule};
+use crate::config::{AppConfig, HotkeyRuleAction, MonitorHotkeyRule, ThemePreference};
 use crate::controller::{Controller, DaemonPhase, DeferredUiAction};
 use crate::display::ccd::query_displays;
 use crate::display::snapshot::{SavedMonitorMode, TopologySnapshot};
@@ -29,10 +29,52 @@ const THEME_JS: &str = include_str!("ui/theme.js");
 const MASCOT_SVG: &str = include_str!("../assets/source/mascot-master.svg");
 const FAVICON_ICO: &[u8] = include_bytes!("../assets/icons/CtrlDark.ico");
 
+#[derive(Clone)]
+pub struct LaunchUrlMinter {
+    port: u16,
+    tokens: Arc<Mutex<Vec<(String, Instant)>>>,
+}
+
+impl LaunchUrlMinter {
+    pub fn mint_launch_url(&self) -> Result<String, String> {
+        let token = generate_session_token()?;
+        let mut guard = self
+            .tokens
+            .lock()
+            .map_err(|_| "Launch token lock poisoned".to_string())?;
+        let now = Instant::now();
+        guard.retain(|(_, created)| {
+            now.saturating_duration_since(*created) <= Duration::from_secs(60)
+        });
+        while guard.len() >= 16 {
+            guard.remove(0);
+        }
+        guard.push((token.clone(), now));
+        Ok(format!("http://127.0.0.1:{}/?launch={token}", self.port))
+    }
+
+    pub fn consume(&self, candidate: &str) -> bool {
+        let mut guard = match self.tokens.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let now = Instant::now();
+        guard.retain(|(_, created)| {
+            now.saturating_duration_since(*created) <= Duration::from_secs(60)
+        });
+        if let Some(pos) = guard.iter().position(|(t, _)| t == candidate) {
+            guard.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 pub struct WebServerHandle {
     pub port: u16,
     pub token: String,
-    pub ui_url: String,
+    pub minter: LaunchUrlMinter,
     pub join: JoinHandle<()>,
 }
 
@@ -74,6 +116,8 @@ struct SaveConfigPayload {
     expected_config: Option<AppConfig>,
     #[serde(default)]
     autostart: Option<bool>,
+    #[serde(default)]
+    expected_autostart: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +143,8 @@ struct ActionPayload {
     desktop: bool,
     #[serde(default)]
     minimized: bool,
+    #[serde(default)]
+    theme: Option<ThemePreference>,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,9 +170,13 @@ pub fn spawn_web_server(
         .map_err(|e| format!("Failed reading bound HTTP port: {e}"))?
         .port();
     let token = generate_session_token()?;
-    let ui_url = format!("http://127.0.0.1:{port}/?token={token}");
+    let minter = LaunchUrlMinter {
+        port,
+        tokens: Arc::new(Mutex::new(Vec::new())),
+    };
 
     let tok = token.clone();
+    let conn_minter = minter.clone();
     let join = thread::Builder::new()
         .name("web-ui-server".to_string())
         .spawn(move || {
@@ -149,13 +199,14 @@ pub fn spawn_web_server(
                     }
                     let ctrl = ctrl_arc.clone();
                     let tok_req = tok.clone();
+                    let mnt_req = conn_minter.clone();
                     connections.fetch_add(1, Ordering::Relaxed);
                     let permit = ConnectionPermit(connections.clone());
                     thread::Builder::new()
                         .name("web-ui-conn".to_string())
                         .spawn(move || {
                             let _permit = permit;
-                            handle_connection(stream, &ctrl, &tok_req);
+                            handle_connection(stream, &ctrl, &tok_req, &mnt_req);
                         })
                         .ok();
                 }
@@ -166,7 +217,7 @@ pub fn spawn_web_server(
     Ok(WebServerHandle {
         port,
         token,
-        ui_url,
+        minter,
         join,
     })
 }
@@ -298,10 +349,42 @@ fn read_request(reader: impl Read) -> Result<HttpRequest, String> {
     })
 }
 
+fn render_index_response(
+    launch_param: Option<&str>,
+    minter: &LaunchUrlMinter,
+    api_token: &str,
+    theme: ThemePreference,
+) -> Result<String, (u16, &'static str)> {
+    let injected_token = match launch_param {
+        Some(candidate) => {
+            if minter.consume(candidate) {
+                api_token
+            } else {
+                return Err((
+                    403,
+                    "Forbidden: invalid, expired, or already-used launch credential. Reopen the Control Panel from the tray icon.",
+                ));
+            }
+        }
+        None => "",
+    };
+    let html = INDEX_HTML
+        .replace("__MT_SESSION_TOKEN__", injected_token)
+        .replace(
+            r#"<meta name="color-scheme" content="light dark">"#,
+            &format!(
+                r#"<meta name="color-scheme" content="{}">"#,
+                theme.color_scheme_meta()
+            ),
+        );
+    Ok(html)
+}
+
 fn handle_connection(
     mut stream: TcpStream,
     ctrl_arc: &Arc<Mutex<Controller>>,
     session_token: &str,
+    minter: &LaunchUrlMinter,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -340,37 +423,32 @@ fn handle_connection(
     }
     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
 
-    let query_token = extract_query_param(query, "token");
-    let cookie_token = headers
-        .get("cookie")
-        .and_then(|c| extract_cookie(c, "mt_csrf"));
+    let launch_token =
+        extract_query_param(query, "launch").or_else(|| extract_query_param(query, "token"));
     let header_token = headers.get("x-mt-token").map(String::as_str);
-
-    let has_valid_page_token = query_token.as_deref() == Some(session_token)
-        || cookie_token.as_deref() == Some(session_token);
     let has_valid_api_token = header_token == Some(session_token);
 
     match (method.as_str(), path) {
         ("GET", "/" | "/index.html") => {
-            if !has_valid_page_token {
-                write_response(
+            let theme = ctrl_arc.lock().map(|c| c.config.theme).unwrap_or_default();
+            match render_index_response(launch_token.as_deref(), minter, session_token, theme) {
+                Ok(html) => write_response(
                     &mut stream,
-                    403,
-                    "text/plain; charset=utf-8",
-                    b"Forbidden: missing or invalid session token. Launch via monitor-toggle-ui or tray icon.",
+                    200,
+                    "text/html; charset=utf-8",
+                    html.as_bytes(),
                     None,
-                );
-                return;
+                ),
+                Err((code, msg)) => {
+                    write_response(
+                        &mut stream,
+                        code,
+                        "text/plain; charset=utf-8",
+                        msg.as_bytes(),
+                        None,
+                    );
+                }
             }
-            let injected = INDEX_HTML.replace("__MT_SESSION_TOKEN__", session_token);
-            let cookie = format!("mt_csrf={session_token}; Path=/; SameSite=Strict; HttpOnly");
-            write_response(
-                &mut stream,
-                200,
-                "text/html; charset=utf-8",
-                injected.as_bytes(),
-                Some(&cookie),
-            );
         }
         ("GET", "/styles.css") => {
             write_response(
@@ -498,17 +576,6 @@ fn extract_query_param(query: &str, name: &str) -> Option<String> {
     None
 }
 
-fn extract_cookie(cookie_hdr: &str, name: &str) -> Option<String> {
-    for part in cookie_hdr.split(';') {
-        if let Some((k, v)) = part.trim().split_once('=') {
-            if k.trim() == name {
-                return Some(v.trim().to_string());
-            }
-        }
-    }
-    None
-}
-
 pub fn collect_state(ctrl_arc: &Arc<Mutex<Controller>>) -> StateResponse {
     let live_ccd = query_displays(true).unwrap_or_default();
     let autostart_on = autostart::is_enabled().ok().flatten().is_some();
@@ -523,7 +590,7 @@ pub fn collect_state(ctrl_arc: &Arc<Mutex<Controller>>) -> StateResponse {
             .map(MonitorHotkeyRule::normalized_for_ui)
             .collect();
         (
-            ctrl.build_status(),
+            ctrl.build_status_for_http(),
             cfg_norm,
             ctrl.snapshot.clone(),
             ctrl.phase == DaemonPhase::SelectiveOff,
@@ -869,12 +936,15 @@ fn handle_save_config(
     validate_and_canonicalize_config(&mut payload.config)?;
 
     let (tx, rx) = mpsc::sync_channel(1);
+    let deadline = Instant::now() + Duration::from_secs(3);
     {
         let mut ctrl = ctrl_arc.lock().expect("controller lock");
         ctrl.enqueue_ui_action(DeferredUiAction::ApplyConfig {
             config: Box::new(payload.config),
             expected_config: payload.expected_config.map(Box::new),
             autostart: payload.autostart,
+            expected_autostart: payload.expected_autostart,
+            deadline,
             reply: tx,
         });
     }
@@ -977,11 +1047,34 @@ fn handle_action(ctrl_arc: &Arc<Mutex<Controller>>, body: &[u8]) -> Result<Actio
                 ) {
                     return Err("All displays are already sleeping. Use Wake All first.".into());
                 }
-                ctrl.enqueue_ui_action(DeferredUiAction::Off(scope, None));
-            } else {
-                ctrl.enqueue_ui_action(DeferredUiAction::Toggle(scope, None));
             }
-            "Test configuration queued".to_string()
+            ctrl.enqueue_ui_action(DeferredUiAction::PreviewProfile(scope));
+            "Test configuration preview queued".to_string()
+        }
+        "sleep_all" => {
+            let mut ctrl = ctrl_arc.lock().expect("controller lock");
+            if ctrl.phase == DaemonPhase::Recovering {
+                return Err(
+                    "Display recovery is currently in progress; wait a moment and try again."
+                        .into(),
+                );
+            }
+            if ctrl.phase == DaemonPhase::RecoveryFailed {
+                return Err(
+                    "Previous display recovery failed. Run Retry Recovery or Force Recover first."
+                        .into(),
+                );
+            }
+            ctrl.enqueue_ui_action(DeferredUiAction::Off(TargetScope::All, None));
+            "All-display sleep queued".to_string()
+        }
+        "set_theme" => {
+            let theme = payload
+                .theme
+                .ok_or_else(|| "Missing appearance theme preference".to_string())?;
+            let mut ctrl = ctrl_arc.lock().expect("controller lock");
+            ctrl.enqueue_ui_action(DeferredUiAction::SetTheme(theme));
+            format!("Appearance set to {}", theme.as_str())
         }
         "toggle_monitor" => {
             let key = payload
@@ -1214,6 +1307,34 @@ mod tests {
         assert_eq!(a.len(), 64);
         assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn one_time_launch_exchange_rejects_replay_and_omits_token_without_launch() {
+        let minter = LaunchUrlMinter {
+            port: 55123,
+            tokens: Arc::new(Mutex::new(Vec::new())),
+        };
+        let url = minter.mint_launch_url().unwrap();
+        let launch_tok = url.split("?launch=").nth(1).unwrap().to_string();
+        let api_tok = "0123456789abcdef0123456789abcdef";
+
+        // First use succeeds and injects api_token and theme meta tag.
+        let ok_html =
+            render_index_response(Some(&launch_tok), &minter, api_tok, ThemePreference::Dark)
+                .unwrap();
+        assert!(ok_html.contains(api_tok));
+        assert!(ok_html.contains(r#"<meta name="color-scheme" content="dark">"#));
+
+        // Second use of the same launch token fails cleanly.
+        let replay =
+            render_index_response(Some(&launch_tok), &minter, api_tok, ThemePreference::Dark);
+        assert!(matches!(replay, Err((403, _))));
+
+        // Plain GET / (e.g. reload) never embeds api_token in the HTML response.
+        let plain = render_index_response(None, &minter, api_tok, ThemePreference::System).unwrap();
+        assert!(!plain.contains(api_tok));
+        assert!(plain.contains(r#"content="""#));
     }
 
     #[test]

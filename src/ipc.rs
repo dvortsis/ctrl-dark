@@ -1,13 +1,18 @@
-//! Named Pipe JSON IPC (`\\.\pipe\monitor-toggle-v1`) between `monitor-toggle` CLI and `monitor-toggled`.
+//! Session-scoped Named Pipe JSON IPC between `monitor-toggle` CLI/UI/launcher and `monitor-toggled`.
 
+use std::fmt;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_IO_PENDING, HANDLE, INVALID_HANDLE_VALUE, WAIT_ABANDONED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED,
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING,
@@ -16,19 +21,391 @@ use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, WaitNamedPipeW, PIPE_READMODE_BYTE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
-
-use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, WAIT_OBJECT_0};
-use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, ReleaseMutex, WaitForSingleObject,
+};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 use crate::config::WakeMode;
 use crate::display::{DisplayInfo, TargetScope};
 use crate::logging;
-use crate::win_util::to_wide_null;
+use crate::win_util::{from_wide_slice, to_wide_null};
 
-pub const PIPE_NAME: &str = r"\\.\pipe\monitor-toggle-v1";
 const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
+const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
 const ERROR_PIPE_CONNECTED: u32 = 535;
+const ERROR_ACCESS_DENIED: u32 = 5;
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_PIPE_BUSY: u32 = 231;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+const TOKEN_QUERY: u32 = 0x0008;
+const TOKEN_USER_CLASS: u32 = 1;
+const SDDL_REVISION_1: u32 = 1;
+const SYNCHRONIZE: u32 = 0x0010_0000;
+
+const DAEMON_MUTEX_NAME: &str = r"Local\MonitorToggleDaemonMutexV1";
+const DISPLAY_OP_MUTEX_NAME: &str = r"Local\MonitorToggleDisplayOpMutexV1";
+
+#[repr(C)]
+struct SidAndAttributes {
+    sid: *mut std::ffi::c_void,
+    attributes: u32,
+}
+
+#[repr(C)]
+struct TokenUser {
+    user: SidAndAttributes,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> HANDLE;
+    fn GetCurrentProcessId() -> u32;
+    fn ProcessIdToSessionId(process_id: u32, session_id: *mut u32) -> i32;
+    fn GetNamedPipeServerProcessId(pipe: HANDLE, server_process_id: *mut u32) -> i32;
+    fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> HANDLE;
+    fn OpenMutexW(desired_access: u32, inherit_handle: i32, name: *const u16) -> HANDLE;
+    fn LocalFree(mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn OpenProcessToken(
+        process_handle: HANDLE,
+        desired_access: u32,
+        token_handle: *mut HANDLE,
+    ) -> i32;
+    fn GetTokenInformation(
+        token_handle: HANDLE,
+        token_information_class: u32,
+        token_information: *mut std::ffi::c_void,
+        token_information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+    fn ConvertSidToStringSidW(sid: *mut std::ffi::c_void, string_sid: *mut *mut u16) -> i32;
+    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        string_security_descriptor: *const u16,
+        string_sd_revision: u32,
+        security_descriptor: *mut *mut std::ffi::c_void,
+        security_descriptor_size: *mut u32,
+    ) -> i32;
+    fn EqualSid(sid1: *const std::ffi::c_void, sid2: *const std::ffi::c_void) -> i32;
+}
+
+struct OwnedHandle(HANDLE);
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+struct LocalAllocPtr(*mut std::ffi::c_void);
+impl Drop for LocalAllocPtr {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+}
+
+struct ProcessIdentity {
+    session_id: u32,
+    sid_buf: Vec<u8>,
+    sid_string: String,
+}
+
+fn query_process_identity(process_handle: HANDLE, pid: u32) -> Result<ProcessIdentity, String> {
+    let mut session_id = 0u32;
+    if unsafe { ProcessIdToSessionId(pid, &mut session_id) } == 0 {
+        return Err(format!(
+            "ProcessIdToSessionId failed for PID {pid} (Win32 error {})",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    let mut raw_token: HANDLE = null_mut();
+    if unsafe { OpenProcessToken(process_handle, TOKEN_QUERY, &mut raw_token) } == 0 {
+        return Err(format!(
+            "OpenProcessToken failed for PID {pid} (Win32 error {})",
+            unsafe { GetLastError() }
+        ));
+    }
+    let _token = OwnedHandle(raw_token);
+
+    let mut needed = 0u32;
+    unsafe {
+        GetTokenInformation(raw_token, TOKEN_USER_CLASS, null_mut(), 0, &mut needed);
+    }
+    if needed == 0 {
+        return Err(format!(
+            "GetTokenInformation size failed (Win32 error {})",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    // u64-aligned storage ensures TokenUser and the trailing SID match Win32 alignment rules.
+    let word_len = (needed as usize).div_ceil(std::mem::size_of::<u64>());
+    let mut words = vec![0u64; word_len];
+    let ok = unsafe {
+        GetTokenInformation(
+            raw_token,
+            TOKEN_USER_CLASS,
+            words.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "GetTokenInformation failed (Win32 error {})",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    let token_user = unsafe { &*(words.as_ptr() as *const TokenUser) };
+    let sid_ptr = token_user.user.sid;
+    let mut str_ptr: *mut u16 = null_mut();
+    if unsafe { ConvertSidToStringSidW(sid_ptr, &mut str_ptr) } == 0 || str_ptr.is_null() {
+        return Err(format!(
+            "ConvertSidToStringSidW failed (Win32 error {})",
+            unsafe { GetLastError() }
+        ));
+    }
+    let _str_alloc = LocalAllocPtr(str_ptr.cast());
+    let wide_slice = unsafe {
+        let mut len = 0usize;
+        while *str_ptr.add(len) != 0 {
+            len += 1;
+        }
+        std::slice::from_raw_parts(str_ptr, len + 1)
+    };
+    let sid_string = from_wide_slice(wide_slice);
+    let sid_bytes = unsafe {
+        let byte_ptr = words.as_ptr() as *const u8;
+        let start = byte_ptr as usize;
+        let offset = (sid_ptr as usize).saturating_sub(start);
+        let len = (needed as usize).saturating_sub(offset);
+        std::slice::from_raw_parts(sid_ptr as *const u8, len).to_vec()
+    };
+
+    Ok(ProcessIdentity {
+        session_id,
+        sid_buf: sid_bytes,
+        sid_string,
+    })
+}
+
+fn current_identity() -> Result<ProcessIdentity, String> {
+    let pid = unsafe { GetCurrentProcessId() };
+    let proc_handle = unsafe { GetCurrentProcess() };
+    query_process_identity(proc_handle, pid)
+}
+
+/// Returns the current logon session + user SID scoped Named Pipe path.
+pub fn pipe_name() -> &'static str {
+    static PIPE_NAME_CELL: OnceLock<String> = OnceLock::new();
+    PIPE_NAME_CELL.get_or_init(|| match current_identity() {
+        Ok(id) => {
+            let safe_sid: String = id
+                .sid_string
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            format!(r"\\.\pipe\monitor-toggle-v1-s{}-{safe_sid}", id.session_id)
+        }
+        Err(_) => format!(r"\\.\pipe\monitor-toggle-v1-p{}", unsafe {
+            GetCurrentProcessId()
+        }),
+    })
+}
+
+fn create_owner_only_security_descriptor() -> Result<LocalAllocPtr, String> {
+    let id = current_identity()?;
+    let sddl = format!("D:(A;;GA;;;{})", id.sid_string);
+    let sddl_w = to_wide_null(&sddl);
+    let mut sd_ptr: *mut std::ffi::c_void = null_mut();
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_w.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sd_ptr,
+            null_mut(),
+        )
+    };
+    if ok == 0 || sd_ptr.is_null() {
+        return Err(format!(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed (Win32 error {})",
+            unsafe { GetLastError() }
+        ));
+    }
+    Ok(LocalAllocPtr(sd_ptr))
+}
+
+fn verify_pipe_server_identity(pipe_handle: HANDLE) -> Result<(), String> {
+    let mut server_pid = 0u32;
+    if unsafe { GetNamedPipeServerProcessId(pipe_handle, &mut server_pid) } == 0 {
+        return Err(format!(
+            "Failed verifying IPC server PID (Win32 error {})",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    let me = current_identity()?;
+    if server_pid == unsafe { GetCurrentProcessId() } {
+        return Ok(());
+    }
+
+    let server_proc = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, server_pid) };
+    if server_proc.is_null() {
+        return Err(format!(
+            "Refusing IPC server PID {server_pid} (cannot query server identity, error {})",
+            unsafe { GetLastError() }
+        ));
+    }
+    let _proc_guard = OwnedHandle(server_proc);
+    let server = query_process_identity(server_proc, server_pid)?;
+    if server.session_id != me.session_id {
+        return Err(format!(
+            "Refusing IPC server in session {} (expected session {})",
+            server.session_id, me.session_id
+        ));
+    }
+    if unsafe { EqualSid(server.sid_buf.as_ptr().cast(), me.sid_buf.as_ptr().cast()) } == 0 {
+        return Err("Refusing IPC server running under a different user account".into());
+    }
+    Ok(())
+}
+
+/// Validates that a Control Panel URL strictly targets `http://127.0.0.1:<port>/` with an
+/// optional single hexadecimal query credential (`launch` or `token`) and no other URI components.
+pub fn validate_loopback_ui_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '@' | '\\' | '#'))
+        || trimmed.contains("..")
+    {
+        return Err("Rejected malformed or unsafe Control Panel URL".into());
+    }
+
+    let Some(after_scheme) = trimmed.strip_prefix("http://127.0.0.1:") else {
+        return Err("Control Panel URL must use http://127.0.0.1:<port>/".into());
+    };
+    let Some((port_str, suffix)) = after_scheme.split_once('/') else {
+        return Err("Control Panel URL must include '/' after loopback port".into());
+    };
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| "Control Panel URL has invalid port".to_string())?;
+    if port == 0 {
+        return Err("Control Panel URL port must be non-zero".into());
+    }
+
+    if !suffix.is_empty() {
+        let Some(query) = suffix.strip_prefix('?') else {
+            return Err("Control Panel URL must target root path '/'".into());
+        };
+        if query.contains('&') {
+            return Err("Control Panel URL must not contain extra query parameters".into());
+        }
+        let val = query
+            .strip_prefix("launch=")
+            .or_else(|| query.strip_prefix("token="))
+            .ok_or_else(|| "Control Panel URL contains unexpected query parameter".to_string())?;
+        if val.is_empty() || val.len() > 128 || !val.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("Control Panel URL contains malformed launch credential".into());
+        }
+    }
+
+    Ok(trimmed.to_string())
+}
+
+/// Returns true if the daemon's session-local instance mutex already exists.
+pub fn is_daemon_mutex_active() -> bool {
+    let name_w = to_wide_null(DAEMON_MUTEX_NAME);
+    let h = unsafe { OpenMutexW(SYNCHRONIZE, 0, name_w.as_ptr()) };
+    if !h.is_null() {
+        unsafe { CloseHandle(h) };
+        true
+    } else {
+        unsafe { GetLastError() == ERROR_ACCESS_DENIED }
+    }
+}
+
+/// Cross-process mutex serializing live display topology mutations (`SetDisplayConfig` / snapshot save)
+/// across the daemon worker and standalone CLI commands.
+pub struct DisplayOpGuard(usize);
+
+impl DisplayOpGuard {
+    pub fn try_acquire(timeout_ms: u32) -> Result<Self, String> {
+        let name_w = to_wide_null(DISPLAY_OP_MUTEX_NAME);
+        let h = unsafe { CreateMutexW(std::ptr::null(), 0, name_w.as_ptr()) };
+        if h.is_null() {
+            return Err(format!(
+                "CreateMutexW({DISPLAY_OP_MUTEX_NAME}) failed (Win32 error {})",
+                unsafe { GetLastError() }
+            ));
+        }
+        let wait = unsafe { WaitForSingleObject(h, timeout_ms) };
+        if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+            Ok(Self(h as usize))
+        } else {
+            unsafe { CloseHandle(h) };
+            if wait == WAIT_TIMEOUT {
+                Err("Another display operation is already in progress; try again shortly.".into())
+            } else {
+                Err(format!(
+                    "Failed waiting for display operation lock (Win32 error {})",
+                    unsafe { GetLastError() }
+                ))
+            }
+        }
+    }
+}
+
+impl Drop for DisplayOpGuard {
+    fn drop(&mut self) {
+        let h = self.0 as HANDLE;
+        if !h.is_null() {
+            unsafe {
+                ReleaseMutex(h);
+                CloseHandle(h);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IpcError {
+    NotRunning(String),
+    TimedOut(String),
+    Protocol(String),
+}
+
+impl fmt::Display for IpcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IpcError::NotRunning(m) | IpcError::TimedOut(m) | IpcError::Protocol(m) => {
+                f.write_str(m)
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -72,6 +449,8 @@ pub struct DaemonStatus {
     pub hotkey_warnings: Vec<String>,
     pub last_recovery_summary: Option<String>,
     #[serde(default)]
+    pub last_lock_error: Option<String>,
+    #[serde(default)]
     pub ui_url: Option<String>,
 }
 
@@ -99,7 +478,7 @@ impl Drop for PipeClientPermit {
     }
 }
 
-/// Spawns the Named Pipe server loop on a dedicated background thread.
+/// Spawns the session- & owner-scoped Named Pipe server loop on a dedicated background thread.
 pub fn spawn_server<F>(stop_flag: Arc<AtomicBool>, handler: F) -> thread::JoinHandle<()>
 where
     F: Fn(IpcRequest) -> IpcResponse + Send + Sync + 'static,
@@ -109,7 +488,15 @@ where
     thread::Builder::new()
         .name("ipc-server".to_string())
         .spawn(move || {
-            let pipe_w = to_wide_null(PIPE_NAME);
+            let pipe_w = to_wide_null(pipe_name());
+            let sd_guard = match create_owner_only_security_descriptor() {
+                Ok(sd) => Some(sd),
+                Err(e) => {
+                    logging::error(format!("Failed creating IPC security descriptor ({e}); aborting pipe server"));
+                    return;
+                }
+            };
+            let mut is_first_instance = true;
             while !stop_flag.load(Ordering::Relaxed) {
                 while active_clients.load(Ordering::Acquire) >= MAX_PIPE_INSTANCES
                     && !stop_flag.load(Ordering::Relaxed)
@@ -120,10 +507,22 @@ where
                     break;
                 }
 
+                let sa = SECURITY_ATTRIBUTES {
+                    nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                    lpSecurityDescriptor: sd_guard.as_ref().map_or(null_mut(), |g| g.0),
+                    bInheritHandle: 0,
+                };
+                let open_mode = PIPE_ACCESS_DUPLEX
+                    | FILE_FLAG_OVERLAPPED
+                    | if is_first_instance {
+                        FILE_FLAG_FIRST_PIPE_INSTANCE
+                    } else {
+                        0
+                    };
                 let handle: HANDLE = unsafe {
                     CreateNamedPipeW(
                         pipe_w.as_ptr(),
-                        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                        open_mode,
                         PIPE_TYPE_BYTE
                             | PIPE_READMODE_BYTE
                             | PIPE_WAIT
@@ -132,18 +531,22 @@ where
                         65536,
                         65536,
                         1000,
-                        null_mut(),
+                        &sa,
                     )
                 };
                 if handle == INVALID_HANDLE_VALUE || handle.is_null() {
                     let err = unsafe { GetLastError() };
-                    if err != 231 {
-                        // ERROR_PIPE_BUSY when max instances are briefly occupied
+                    if is_first_instance && err == ERROR_ACCESS_DENIED {
+                        logging::error("Refusing to attach IPC server to existing untrusted pipe instance (ERROR_ACCESS_DENIED)");
+                        break;
+                    }
+                    if err != ERROR_PIPE_BUSY {
                         logging::error(format!("CreateNamedPipeW failed with error {err}"));
                     }
                     thread::sleep(Duration::from_millis(50));
                     continue;
                 }
+                is_first_instance = false;
 
                 let connected = pipe_io(
                     handle,
@@ -327,13 +730,15 @@ where
 
 /// Sends a request with a deadline covering connection, write and response reads.
 pub fn send_request(req: &IpcRequest, timeout_ms: u32) -> Result<IpcResponse, String> {
-    send_request_to(PIPE_NAME, req, timeout_ms)
+    send_request_typed(req, timeout_ms).map_err(|e| e.to_string())
 }
 
-fn send_request_to(name: &str, req: &IpcRequest, timeout_ms: u32) -> Result<IpcResponse, String> {
-    const ERROR_FILE_NOT_FOUND: u32 = 2;
-    const ERROR_PIPE_BUSY: u32 = 231;
+/// Sends a request while distinguishing daemon-absent errors from in-flight timeouts.
+pub fn send_request_typed(req: &IpcRequest, timeout_ms: u32) -> Result<IpcResponse, IpcError> {
+    send_request_to(pipe_name(), req, timeout_ms)
+}
 
+fn send_request_to(name: &str, req: &IpcRequest, timeout_ms: u32) -> Result<IpcResponse, IpcError> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1) as u64);
     let pipe_w = to_wide_null(name);
     let handle = loop {
@@ -351,7 +756,10 @@ fn send_request_to(name: &str, req: &IpcRequest, timeout_ms: u32) -> Result<IpcR
                 0,
                 null_mut(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                FILE_ATTRIBUTE_NORMAL
+                    | FILE_FLAG_OVERLAPPED
+                    | SECURITY_SQOS_PRESENT
+                    | SECURITY_IDENTIFICATION,
                 null_mut(),
             )
         };
@@ -360,9 +768,19 @@ fn send_request_to(name: &str, req: &IpcRequest, timeout_ms: u32) -> Result<IpcR
         }
         let err = unsafe { GetLastError() };
         if Instant::now() >= deadline {
-            return Err(format!(
-                "Daemon is not running or pipe unavailable (Win32 error {err})"
-            ));
+            return if err == ERROR_FILE_NOT_FOUND {
+                Err(IpcError::NotRunning(format!(
+                    "Daemon is not running or pipe unavailable (Win32 error {err})"
+                )))
+            } else if err == ERROR_PIPE_BUSY {
+                Err(IpcError::TimedOut(format!(
+                    "IPC pipe busy past {timeout_ms}ms deadline (Win32 error {err})"
+                )))
+            } else {
+                Err(IpcError::Protocol(format!(
+                    "IPC pipe connection failed (Win32 error {err})"
+                )))
+            };
         }
         if err == ERROR_PIPE_BUSY {
             thread::sleep(Duration::from_millis(5));
@@ -372,18 +790,26 @@ fn send_request_to(name: &str, req: &IpcRequest, timeout_ms: u32) -> Result<IpcR
             thread::sleep(Duration::from_millis(15));
             continue;
         }
-        return Err(format!(
-            "Daemon is not running or pipe unavailable (Win32 error {err})"
-        ));
+        return Err(IpcError::Protocol(format!(
+            "Daemon IPC unavailable (Win32 error {err})"
+        )));
     };
-    let result = (|| {
-        let mut payload = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+    let result = (|| -> Result<IpcResponse, IpcError> {
+        verify_pipe_server_identity(handle).map_err(IpcError::Protocol)?;
+        let mut payload = serde_json::to_vec(req).map_err(|e| IpcError::Protocol(e.to_string()))?;
         payload.push(b'\n');
-        write_message(handle, &payload, deadline)?;
-        let response = read_message(handle, deadline)?;
+        let map_io_err = |msg: String| -> IpcError {
+            if msg.contains("timed out") {
+                IpcError::TimedOut(msg)
+            } else {
+                IpcError::Protocol(msg)
+            }
+        };
+        write_message(handle, &payload, deadline).map_err(map_io_err)?;
+        let response = read_message(handle, deadline).map_err(map_io_err)?;
         let _ = write_message(handle, b"\n", deadline);
         serde_json::from_slice::<IpcResponse>(&response)
-            .map_err(|e| format!("Invalid IPC response JSON: {e}"))
+            .map_err(|e| IpcError::Protocol(format!("Invalid IPC response JSON: {e}")))
     })();
     unsafe {
         CloseHandle(handle);
@@ -393,7 +819,7 @@ fn send_request_to(name: &str, req: &IpcRequest, timeout_ms: u32) -> Result<IpcR
 
 /// Sends a dummy connect/disconnect wake-up so a blocking `ConnectNamedPipe` exits on shutdown.
 pub fn poke_pipe_for_shutdown() {
-    let pipe_w = to_wide_null(PIPE_NAME);
+    let pipe_w = to_wide_null(pipe_name());
     let handle = unsafe {
         CreateFileW(
             pipe_w.as_ptr(),
@@ -401,7 +827,7 @@ pub fn poke_pipe_for_shutdown() {
             0,
             null_mut(),
             OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
             null_mut(),
         )
     };
@@ -491,11 +917,46 @@ mod tests {
             thread::sleep(Duration::from_millis(250));
         });
         let start = Instant::now();
-        assert!(send_request_to(&name, &IpcRequest::Status, 50)
-            .unwrap_err()
-            .contains("timed out"));
+        let err = send_request_to(&name, &IpcRequest::Status, 50).unwrap_err();
+        assert!(matches!(err, IpcError::TimedOut(_)));
+        assert!(err.to_string().contains("timed out"));
         assert!(start.elapsed() < Duration::from_millis(200));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn ipc_error_distinguishes_not_running_from_timeout() {
+        let missing_pipe = format!(
+            r"\\.\pipe\monitor-toggle-nonexistent-{}",
+            std::process::id()
+        );
+        let err = send_request_to(&missing_pipe, &IpcRequest::Status, 25).unwrap_err();
+        assert!(matches!(err, IpcError::NotRunning(_)));
+    }
+
+    #[test]
+    fn validate_loopback_ui_url_enforces_strict_allowlist() {
+        assert!(validate_loopback_ui_url("http://127.0.0.1:49152/").is_ok());
+        assert!(validate_loopback_ui_url("http://127.0.0.1:49152/?launch=0123abcd").is_ok());
+        assert!(validate_loopback_ui_url("http://127.0.0.1:49152/?token=deadbeef").is_ok());
+
+        for bad in [
+            "",
+            "https://example.com/",
+            "http://localhost:49152/",
+            "http://127.0.0.1:0/",
+            "http://127.0.0.1:49152/evil",
+            "http://127.0.0.1:49152/?launch=01&extra=2",
+            "http://127.0.0.1:49152/?launch=not_hex!",
+            "http://user@127.0.0.1:49152/",
+            "file:///C:/Windows/System32/calc.exe",
+            "calc.exe",
+        ] {
+            assert!(
+                validate_loopback_ui_url(bad).is_err(),
+                "expected URL rejection for {bad}"
+            );
+        }
     }
 
     #[test]

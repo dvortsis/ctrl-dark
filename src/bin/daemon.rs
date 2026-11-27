@@ -108,7 +108,7 @@ fn main() {
     let web_handle = match spawn_web_server(ctrl_arc.clone(), stop_ipc.clone()) {
         Ok(h) => {
             if let Ok(mut ctrl) = ctrl_arc.lock() {
-                ctrl.ui_url = Some(h.ui_url.clone());
+                ctrl.set_launch_minter(h.minter.clone());
             }
             logging::info(format!(
                 "Control Panel HTTP API listening at 127.0.0.1:{}",
@@ -142,6 +142,13 @@ fn main() {
     }
     poke_pipe_for_shutdown();
     let _ = ipc_join.join();
+    if let Some(worker_join) = ctrl_arc
+        .lock()
+        .ok()
+        .and_then(|mut ctrl| ctrl.take_worker_join())
+    {
+        let _ = worker_join.join();
+    }
 
     unsafe {
         DestroyWindow(hwnd);
@@ -273,7 +280,7 @@ unsafe extern "system" fn daemon_wndproc(
             } else if sub == WM_LBUTTONUP {
                 let url = CONTROLLER
                     .get()
-                    .and_then(|arc| arc.lock().ok().and_then(|ctrl| ctrl.ui_url.clone()));
+                    .and_then(|arc| arc.lock().ok().and_then(|ctrl| ctrl.mint_ui_url()));
                 if let Err(e) = autostart::launch_ui_window(url.as_deref(), false) {
                     logging::warn(format!("Failed opening Control Panel from tray click: {e}"));
                 }

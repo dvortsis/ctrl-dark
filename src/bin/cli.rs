@@ -15,7 +15,10 @@ use monitor_toggle::display::snapshot::{
     capture_active_snapshot, load_snapshot, plan_restore, save_snapshot_atomic,
 };
 use monitor_toggle::display::{resolve_scope_keys, TargetScope};
-use monitor_toggle::ipc::{send_request, IpcRequest, IpcResponse};
+use monitor_toggle::ipc::{
+    is_daemon_mutex_active, send_request, send_request_typed, DisplayOpGuard, IpcError, IpcRequest,
+    IpcResponse,
+};
 use monitor_toggle::launcher::{self, LaunchAction, LaunchOptions};
 use monitor_toggle::window_restore::{capture_windows, wait_for_gdi_monitors};
 
@@ -231,10 +234,21 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Commands::Recover { hard, standalone } => {
             if !standalone {
-                if let Ok(resp) = send_request(&IpcRequest::Recover { hard }, 1000) {
-                    return print_simple_response(resp);
+                match send_request_typed(&IpcRequest::Recover { hard }, 1500) {
+                    Ok(resp) => return print_simple_response(resp),
+                    Err(IpcError::NotRunning(_)) if !is_daemon_mutex_active() => {}
+                    Err(err) => {
+                        return Err(format!(
+                            "Daemon recovery status is unknown ({err}). Stop the daemon or pass --standalone to force direct execution."
+                        ));
+                    }
                 }
             }
+            let _op_guard = if standalone {
+                DisplayOpGuard::try_acquire(2000)?
+            } else {
+                ensure_standalone_safe("recovery")?
+            };
             let cfg = AppConfig::load_or_create_default()?;
             let snap = load_snapshot(&config::snapshot_path())?;
             let level = if hard {
@@ -306,8 +320,22 @@ fn run(cli: Cli) -> Result<(), String> {
             }
         },
         Commands::Snapshot => {
-            if let Ok(response) = send_request(&IpcRequest::SnapshotNow, 1000) {
-                return print_simple_response(response);
+            match send_request_typed(&IpcRequest::SnapshotNow, 1500) {
+                Ok(response) => return print_simple_response(response),
+                Err(IpcError::NotRunning(_)) if !is_daemon_mutex_active() => {}
+                Err(err) => {
+                    return Err(format!(
+                        "Could not capture snapshot via daemon ({err}). Stop the daemon before running standalone snapshot."
+                    ));
+                }
+            }
+            let _op_guard = ensure_standalone_safe("snapshot")?;
+            let live = query_displays(true)?;
+            if live.iter().any(|d| d.available && !d.active) {
+                return Err(
+                    "One or more connected displays are currently off. Wake all displays before replacing the recovery snapshot."
+                        .into(),
+                );
             }
             let snap = capture_active_snapshot()?;
             let count = snap.monitors.len();
@@ -477,13 +505,29 @@ fn run(cli: Cli) -> Result<(), String> {
     }
 }
 
+fn ensure_standalone_safe(action_name: &str) -> Result<DisplayOpGuard, String> {
+    if is_daemon_mutex_active()
+        || !matches!(
+            send_request_typed(&IpcRequest::Status, 500),
+            Err(IpcError::NotRunning(_))
+        )
+    {
+        return Err(format!(
+            "Stop the daemon before running a standalone {action_name} so its recovery worker cannot race display changes."
+        ));
+    }
+    DisplayOpGuard::try_acquire(2000)
+}
+
 fn run_bench(except: Vec<String>, hold_ms: u64, dry_run: bool) -> Result<(), String> {
     if hold_ms > 60_000 {
         return Err("Benchmark hold_ms must not exceed 60000".into());
     }
-    if !dry_run && send_request(&IpcRequest::Status, 800).is_ok() {
-        return Err("Stop the daemon before a live benchmark so its recovery worker cannot race the benchmark. Use --dry-run for read-only inspection.".into());
-    }
+    let _op_guard = if !dry_run {
+        Some(ensure_standalone_safe("benchmark")?)
+    } else {
+        None
+    };
     let cfg = AppConfig::load_or_create_default()?;
     let t_cap = Instant::now();
     let active = query_displays(false)?;
@@ -627,11 +671,11 @@ fn print_simple_response(resp: IpcResponse) -> Result<(), String> {
 }
 
 fn ensure_daemon_running() -> Result<(), String> {
-    launcher::ensure_daemon_running(false).map(|_| ())
+    launcher::ensure_daemon_running_with_options(false, false).map(|_| ())
 }
 
 fn start_daemon_process() -> Result<(), String> {
-    launcher::ensure_daemon_running(false).map(|_| ())
+    launcher::ensure_daemon_running_with_options(false, false).map(|_| ())
 }
 
 fn print_monitors_table(displays: &[monitor_toggle::display::DisplayInfo]) {

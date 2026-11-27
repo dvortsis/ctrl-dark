@@ -196,15 +196,7 @@ impl Default for HotkeysConfig {
             toggle_all: "Ctrl+Alt+M".to_string(),
             toggle_externals: "Ctrl+Alt+E".to_string(),
             force_recover: "Ctrl+Alt+Shift+M".to_string(),
-            monitor_hotkeys: vec![MonitorHotkeyRule {
-                hotkey: "Ctrl+Alt+D".to_string(),
-                label: Some("Only P27h-20 & J560T09".to_string()),
-                include: vec!["P27h-20".to_string(), "J560T09".to_string()],
-                exclude: Vec::new(),
-                selector: None,
-                except: Vec::new(),
-                action: HotkeyRuleAction::Toggle,
-            }],
+            monitor_hotkeys: Vec::new(),
         }
     }
 }
@@ -237,6 +229,33 @@ impl Default for RecoveryConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemePreference {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePreference {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    pub fn color_scheme_meta(&self) -> &'static str {
+        match self {
+            Self::System => "light dark",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
 fn default_start_minimized() -> bool {
     true
 }
@@ -247,6 +266,8 @@ pub struct AppConfig {
     #[serde(default = "default_start_minimized")]
     pub start_minimized_to_tray: bool,
     pub wake_mode: WakeMode,
+    #[serde(default)]
+    pub theme: ThemePreference,
     #[serde(default)]
     pub lock_workstation_on_sleep: bool,
     #[serde(default)]
@@ -260,6 +281,7 @@ impl Default for AppConfig {
         Self {
             start_minimized_to_tray: true,
             wake_mode: WakeMode::HotkeyOnly,
+            theme: ThemePreference::System,
             lock_workstation_on_sleep: false,
             wake_on_session_unlock: false,
             hotkeys: HotkeysConfig::default(),
@@ -349,6 +371,8 @@ start_minimized_to_tray = true
 #   "hotkey_only" - Ignore mouse bumps & stray keys while toggled off (press Esc 3x as failsafe)
 #   "any_input"   - Normal DPMS sleep (any mouse/key or hotkey wakes & recovers displays)
 wake_mode = "hotkey_only"
+# Control Panel theme: "system", "light", or "dark"
+theme = "system"
 # Lock Windows (Win+L equivalent) when turning off monitors
 lock_workstation_on_sleep = false
 # Wake monitors and run display recovery automatically when unlocking Windows
@@ -362,13 +386,13 @@ toggle_externals = "Ctrl+Alt+E"
 # Blind force-recover / link bounce (works anytime, even if screens are black)
 force_recover = "Ctrl+Alt+Shift+M"
 
-# Optional per-monitor configurations / hotkeys.
+# Optional per-monitor configurations / hotkeys (configure in Control Panel or uncomment below).
 # Use `include` to keep selected displays ON, and/or `exclude` to turn selected displays OFF.
-[[hotkeys.monitor_hotkeys]]
-hotkey = "Ctrl+Alt+D"
-label = "Only P27h-20 & J560T09"
-include = ["P27h-20", "J560T09"]
-action = "toggle"
+# [[hotkeys.monitor_hotkeys]]
+# hotkey = "Ctrl+Alt+D"
+# label = "Dual 27\" Focus"
+# include = ["My Monitor 1", "My Monitor 2"]
+# action = "toggle"
 
 [recovery]
 settle_timeout_ms = 4000
@@ -423,7 +447,9 @@ mod tests {
         let parsed = AppConfig::from_toml_str(&raw).expect("parse default");
         assert_eq!(cfg, parsed);
         assert_eq!(parsed.wake_mode, WakeMode::HotkeyOnly);
+        assert_eq!(parsed.theme, ThemePreference::System);
         assert_eq!(parsed.hotkeys.toggle_all, "Ctrl+Alt+M");
+        assert!(parsed.hotkeys.monitor_hotkeys.is_empty());
     }
 
     #[test]

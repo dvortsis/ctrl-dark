@@ -103,7 +103,9 @@ fn signal_existing_ui_window() {
 
 fn resolve_ui_url() -> Result<String, String> {
     let (_, ui_url) = launcher::ensure_daemon_running(false)?;
-    ui_url.ok_or_else(|| "Timed out waiting for monitor-toggled Control Panel URL".to_string())
+    let raw = ui_url
+        .ok_or_else(|| "Timed out waiting for monitor-toggled Control Panel URL".to_string())?;
+    monitor_toggle::ipc::validate_loopback_ui_url(&raw)
 }
 
 fn query_daemon_ui_url() -> Option<String> {
@@ -111,9 +113,24 @@ fn query_daemon_ui_url() -> Option<String> {
         status: Some(st), ..
     }) = send_request(&IpcRequest::Status, 600)
     {
-        return st.ui_url;
+        return st
+            .ui_url
+            .and_then(|u| monitor_toggle::ipc::validate_loopback_ui_url(&u).ok());
     }
     None
+}
+
+fn url_origin_prefix(validated_url: &str) -> Option<String> {
+    let end = validated_url.find("/").and_then(|scheme_idx| {
+        if validated_url.get(scheme_idx..scheme_idx + 2) == Some("//") {
+            validated_url[scheme_idx + 2..]
+                .find('/')
+                .map(|rel| scheme_idx + 2 + rel + 1)
+        } else {
+            None
+        }
+    })?;
+    Some(validated_url[..end].to_string())
 }
 
 fn run_webview_window(ui_url: &str) -> Result<(), String> {
@@ -153,9 +170,13 @@ fn run_webview_window(ui_url: &str) -> Result<(), String> {
     let _ = std::fs::create_dir_all(&webview_dir);
     let mut web_ctx = WebContext::new(Some(webview_dir));
 
+    let allowed_origin = url_origin_prefix(ui_url)
+        .ok_or_else(|| "Invalid Control Panel loopback origin".to_string())?;
+    let nav_origin = allowed_origin.clone();
     let webview = WebViewBuilder::new_with_web_context(&mut web_ctx)
         .with_url(ui_url)
         .with_clipboard(true)
+        .with_navigation_handler(move |uri| uri.starts_with(&nav_origin))
         .build(&window)
         .map_err(|e| format!("WebView2 build failed: {e}"))?;
 
@@ -195,9 +216,11 @@ fn run_webview_window(ui_url: &str) -> Result<(), String> {
                 window.set_minimized(false);
                 window.set_focus();
                 if let Some(new_url) = maybe_url {
-                    if new_url != current_url {
-                        current_url = new_url.clone();
-                        let _ = webview.load_url(&new_url);
+                    if let Ok(valid_new) = monitor_toggle::ipc::validate_loopback_ui_url(&new_url) {
+                        if valid_new.starts_with(&allowed_origin) && valid_new != current_url {
+                            current_url = valid_new.clone();
+                            let _ = webview.load_url(&valid_new);
+                        }
                     }
                 }
             }

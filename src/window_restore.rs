@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -226,6 +226,7 @@ const MAX_RESTORE_THREADS: usize = 8;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RestoreStats {
     pub restored: usize,
+    pub failed: usize,
     pub threads_used: usize,
     pub max_window_ms: u64,
 }
@@ -235,6 +236,28 @@ struct PendingWindowRestore<'a> {
     cur_show_cmd: u32,
     cur_rect: RECT,
     target_work: RECT,
+}
+
+/// Translates a saved screen rectangle relative to its old monitor work area into the
+/// destination work area and clamps it so a surviving monitor moving to `(0, 0)` never
+/// places restored windows off-screen.
+fn compute_restored_window_rect(saved_rect: RECT, old_work: RECT, new_work: RECT) -> RECT {
+    let work_w = (new_work.right - new_work.left).max(100);
+    let work_h = (new_work.bottom - new_work.top).max(80);
+    let width = (saved_rect.right - saved_rect.left).clamp(100, work_w);
+    let height = (saved_rect.bottom - saved_rect.top).clamp(80, work_h);
+    let dx = saved_rect.left - old_work.left;
+    let dy = saved_rect.top - old_work.top;
+    let max_x = (new_work.right - width).max(new_work.left);
+    let max_y = (new_work.bottom - height).max(new_work.top);
+    let left = (new_work.left + dx).clamp(new_work.left, max_x);
+    let top = (new_work.top + dy).clamp(new_work.top, max_y);
+    RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    }
 }
 
 fn partition_into_buckets<T>(items: Vec<T>, max_buckets: usize) -> Vec<Vec<T>> {
@@ -250,11 +273,11 @@ fn partition_into_buckets<T>(items: Vec<T>, max_buckets: usize) -> Vec<Vec<T>> {
     buckets
 }
 
-fn restore_one_window(item: &PendingWindowRestore<'_>) -> u64 {
+fn restore_one_window(item: &PendingWindowRestore<'_>) -> (u64, bool) {
     let t0 = Instant::now();
     let w = item.window;
     let hwnd = w.hwnd as HWND;
-    unsafe {
+    let ok = unsafe {
         if w.is_maximized {
             let work = item.target_work;
             let work_w = (work.right - work.left).max(200);
@@ -274,7 +297,7 @@ fn restore_one_window(item: &PendingWindowRestore<'_>) -> u64 {
             if item.cur_show_cmd == SW_SHOWMAXIMIZED as u32 {
                 ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
             }
-            SetWindowPos(
+            let pos_ok = SetWindowPos(
                 hwnd,
                 null_mut(),
                 nx,
@@ -282,14 +305,19 @@ fn restore_one_window(item: &PendingWindowRestore<'_>) -> u64 {
                 norm_w,
                 norm_h,
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
-            );
-            ShowWindowAsync(hwnd, SW_MAXIMIZE);
+            ) != 0;
+            if pos_ok {
+                ShowWindowAsync(hwnd, SW_MAXIMIZE);
+            }
+            pos_ok
         } else {
             if item.cur_show_cmd == SW_SHOWMAXIMIZED as u32 {
                 ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
             }
-            let width = (w.window_rect.right - w.window_rect.left).max(100);
-            let height = (w.window_rect.bottom - w.window_rect.top).max(80);
+            let dest =
+                compute_restored_window_rect(w.window_rect, w.monitor_work, item.target_work);
+            let width = dest.right - dest.left;
+            let height = dest.bottom - dest.top;
             let cur_w = item.cur_rect.right - item.cur_rect.left;
             let cur_h = item.cur_rect.bottom - item.cur_rect.top;
             let size_flag = if cur_w == width && cur_h == height {
@@ -300,15 +328,15 @@ fn restore_one_window(item: &PendingWindowRestore<'_>) -> u64 {
             SetWindowPos(
                 hwnd,
                 null_mut(),
-                w.window_rect.left,
-                w.window_rect.top,
+                dest.left,
+                dest.top,
                 width,
                 height,
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS | size_flag,
-            );
+            ) != 0
         }
-    }
-    t0.elapsed().as_millis() as u64
+    };
+    (t0.elapsed().as_millis() as u64, ok)
 }
 
 /// Restores displaced windows back onto their saved monitor (`SWP_ASYNCWINDOWPOS` + `ShowWindowAsync`),
@@ -362,20 +390,26 @@ pub fn restore_windows(
                 continue;
             }
 
-            let moved_far = (cur_rect.left - w.window_rect.left).abs() > 12
-                || (cur_rect.top - w.window_rect.top).abs() > 12
-                || (cur_rect.right - w.window_rect.right).abs() > 12
-                || (cur_rect.bottom - w.window_rect.bottom).abs() > 12
+            let target_work = live_work_by_gdi
+                .get(target_gdi)
+                .copied()
+                .unwrap_or(w.monitor_work);
+            let expected_rect = if w.is_maximized {
+                w.window_rect
+            } else {
+                compute_restored_window_rect(w.window_rect, w.monitor_work, target_work)
+            };
+
+            let moved_far = (cur_rect.left - expected_rect.left).abs() > 12
+                || (cur_rect.top - expected_rect.top).abs() > 12
+                || (cur_rect.right - expected_rect.right).abs() > 12
+                || (cur_rect.bottom - expected_rect.bottom).abs() > 12
                 || (w.is_maximized && cur_place.showCmd != SW_SHOWMAXIMIZED as u32);
 
             if !moved_far {
                 continue;
             }
 
-            let target_work = live_work_by_gdi
-                .get(target_gdi)
-                .copied()
-                .unwrap_or(w.monitor_work);
             pending.push(PendingWindowRestore {
                 window: w,
                 cur_show_cmd: cur_place.showCmd,
@@ -385,34 +419,39 @@ pub fn restore_windows(
         }
     }
 
-    let restored_count = pending.len();
     let buckets = partition_into_buckets(pending, MAX_RESTORE_THREADS);
     let threads_used = buckets.len();
     let max_window_ms = AtomicU64::new(0);
+    let restored_ok = AtomicUsize::new(0);
+    let restored_failed = AtomicUsize::new(0);
+
+    let run_bucket = |bucket: &[PendingWindowRestore<'_>]| {
+        for item in bucket {
+            let (elapsed, ok) = restore_one_window(item);
+            max_window_ms.fetch_max(elapsed, Ordering::Relaxed);
+            if ok {
+                restored_ok.fetch_add(1, Ordering::Relaxed);
+            } else {
+                restored_failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    };
 
     if threads_used <= 1 {
         if let Some(bucket) = buckets.first() {
-            for item in bucket {
-                let elapsed = restore_one_window(item);
-                max_window_ms.fetch_max(elapsed, Ordering::Relaxed);
-            }
+            run_bucket(bucket);
         }
     } else {
         thread::scope(|scope| {
-            let max_ref = &max_window_ms;
             for bucket in &buckets {
-                scope.spawn(move || {
-                    for item in bucket {
-                        let elapsed = restore_one_window(item);
-                        max_ref.fetch_max(elapsed, Ordering::Relaxed);
-                    }
-                });
+                scope.spawn(|| run_bucket(bucket));
             }
         });
     }
 
     RestoreStats {
-        restored: restored_count,
+        restored: restored_ok.load(Ordering::Relaxed),
+        failed: restored_failed.load(Ordering::Relaxed),
         threads_used,
         max_window_ms: max_window_ms.load(Ordering::Relaxed),
     }
@@ -464,5 +503,49 @@ mod tests {
         let flattened: HashSet<usize> = buckets.iter().flatten().copied().collect();
         assert_eq!(flattened.len(), 18);
         assert!(buckets.iter().all(|b| (2..=3).contains(&b.len())));
+    }
+
+    #[test]
+    fn translates_and_clamps_window_rect_when_monitor_origin_shifts() {
+        let saved = RECT {
+            left: 2660,
+            top: 120,
+            right: 3660,
+            bottom: 820,
+        };
+        let old_work = RECT {
+            left: 2560,
+            top: 0,
+            right: 5120,
+            bottom: 1400,
+        };
+        // Surviving monitor shifted to origin (0, 0) with slightly smaller work area
+        let new_work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let translated = compute_restored_window_rect(saved, old_work, new_work);
+        assert_eq!(
+            (
+                translated.left,
+                translated.top,
+                translated.right,
+                translated.bottom
+            ),
+            (100, 120, 1100, 820)
+        );
+
+        // Even if the offset exceeded new_work bounds, clamp onto new_work cleanly
+        let far = RECT {
+            left: 4900,
+            top: 1200,
+            right: 5900,
+            bottom: 2000,
+        };
+        let clamped = compute_restored_window_rect(far, old_work, new_work);
+        assert!(clamped.left >= new_work.left && clamped.right <= new_work.right);
+        assert!(clamped.top >= new_work.top && clamped.bottom <= new_work.bottom);
     }
 }

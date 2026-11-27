@@ -14,6 +14,7 @@ function fixture() {
     monitors, autostart: false, active_rule_indices: [],
     status: { state: 'active_on', active_monitors: 2, total_available_monitors: 2, snapshot_monitors: 2, snapshot_captured_unix_ms: 1700000000000, hotkey_warnings: [] },
     config: {
+      theme: 'system',
       start_minimized_to_tray: true,
       lock_workstation_on_sleep: false,
       wake_on_session_unlock: false,
@@ -261,11 +262,14 @@ test('duplicate opens an unsaved draft and modal test layout shows in-dialog fee
   expect(mock.writes).toHaveLength(0);
 
   await page.locator('#btn-test-config').click();
-  await expect(page.locator('#config-status')).toBeVisible();
-  await expect(page.locator('#config-status')).toContainText('Action queued');
+  await expect(page.locator('#config-preview-bar')).toBeVisible();
+  await expect.poll(() => mock.actions.length).toBe(1);
+  expect(mock.actions[0]).toMatchObject({ action: 'apply_preview' });
 
   await page.locator('#btn-cancel-config').click();
   await expect(page.locator('#config-dialog')).not.toBeVisible();
+  await expect.poll(() => mock.actions.length).toBe(2);
+  expect(mock.actions[1]).toEqual({ action: 'wake_all' });
   expect(mock.writes).toHaveLength(0);
 
   await page.getByRole('button', { name: 'Duplicate: Desk focus', exact: true }).click();
@@ -436,6 +440,144 @@ test('selective off topology stage renders all monitors cleanly without overlap'
   const zActive = await stageBoxes.nth(0).evaluate((el) => Number(getComputedStyle(el).zIndex));
   const zOff = await stageBoxes.nth(2).evaluate((el) => Number(getComputedStyle(el).zIndex));
   expect(zActive).toBeGreaterThan(zOff);
+});
+
+test('editing a profile preserves untouched friendly-name selectors', async ({ page }) => {
+  const mock = await setup(page);
+  mock.state.config.hotkeys.monitor_hotkeys[0].include = ['Desk Display'];
+  await page.locator('#btn-refresh').click();
+
+  await page.getByRole('button', { name: 'Edit: Desk focus', exact: true }).click();
+  await page.locator('#cfg-label').fill('Desk focus renamed');
+  await page.locator('#btn-save-config').click();
+
+  await expect.poll(() => mock.writes.length).toBe(1);
+  expect(mock.writes[0].config.hotkeys.monitor_hotkeys[0].label).toBe('Desk focus renamed');
+  expect(mock.writes[0].config.hotkeys.monitor_hotkeys[0].include).toEqual(['Desk Display']);
+});
+
+test('saving unrelated settings omits autostart unless explicitly toggled', async ({ page }) => {
+  const mock = await setup(page);
+  await page.locator('#hk-toggle-all').fill('Ctrl+Shift+F7');
+  await page.locator('#btn-save-settings').click();
+
+  await expect.poll(() => mock.writes.length).toBe(1);
+  expect(mock.writes[0].autostart).toBeUndefined();
+  expect(mock.writes[0].expected_autostart).toBeUndefined();
+
+  await page.locator('#opt-autostart').check();
+  await page.locator('#btn-save-settings').click();
+  await expect.poll(() => mock.writes.length).toBe(2);
+  expect(mock.writes[1].autostart).toBe(true);
+  expect(mock.writes[1].expected_autostart).toBe(false);
+});
+
+test('header primary action handles active sleep_all, recovery_failed retry, and recovering lockouts', async ({ page }) => {
+  const mock = await setup(page);
+  await expect(page.locator('#btn-toggle-all')).toHaveText('Sleep All');
+  await page.locator('#btn-toggle-all').click();
+  await expect.poll(() => mock.actions.length).toBe(1);
+  expect(mock.actions[0]).toEqual({ action: 'sleep_all' });
+
+  mock.state.status.state = 'recovery_failed';
+  await page.locator('#btn-refresh').click();
+  await expect(page.locator('#btn-toggle-all')).toHaveText('Retry Recovery');
+  await page.locator('#btn-toggle-all').click();
+  await expect.poll(() => mock.actions.length).toBe(2);
+  expect(mock.actions[1]).toEqual({ action: 'recover', hard: false });
+
+  mock.state.status.state = 'recovering';
+  await page.locator('#btn-refresh').click();
+  await expect(page.locator('#btn-toggle-all')).toBeDisabled();
+  await expect(page.locator('#btn-wake-all')).toBeDisabled();
+  await expect(page.locator('#btn-force-recover')).toBeDisabled();
+  await expect(page.locator('#btn-toggle-externals')).toBeDisabled();
+  await expect(page.locator('#btn-snapshot')).toBeDisabled();
+});
+
+test('action errors survive refresh polls while lock errors take alert precedence', async ({ page }) => {
+  const mock = await setup(page);
+  await page.route('http://127.0.0.1:33333/api/action', (route) =>
+    route.fulfill({ status: 400, json: { error: 'Action rejected' } }),
+  );
+  await page.locator('#btn-wake-all').click();
+  await expect(page.locator('#alert-banner')).toContainText('Action rejected');
+
+  await page.locator('#btn-refresh').click();
+  await expect(page.locator('#alert-banner')).toContainText('Action rejected');
+
+  mock.state.status.last_lock_error = 'Workstation lock rejected';
+  await page.locator('#btn-refresh').click();
+  await expect(page.locator('#alert-banner')).toContainText('Workstation lock rejected');
+
+  mock.state.status.last_lock_error = null;
+  await page.locator('#btn-refresh').click();
+  await expect(page.locator('#alert-banner')).toContainText('Action rejected');
+});
+
+test('mirrored displays sharing coordinates stay independently clickable', async ({ page }) => {
+  const mock = await setup(page);
+  mock.state.monitors = [
+    {
+      friendly_name: 'Laptop Mirror', stable_key: 'display#internal#1', gdi_name: 'DISPLAY1', edid_code: 'INT1',
+      role: 'internal', active: true, available: true, is_primary: true,
+      position: [0, 0], resolution: [1920, 1080], refresh_hz: 60,
+    },
+    {
+      friendly_name: 'Projector Mirror', stable_key: 'display#ext#2', gdi_name: 'DISPLAY1', edid_code: 'EXT2',
+      role: 'external', active: true, available: true, is_primary: false,
+      position: [0, 0], resolution: [1920, 1080], refresh_hz: 60,
+    },
+  ];
+  await page.locator('#btn-refresh').click();
+
+  await expect(page.locator('#topology-stage .stage-monitor-group')).toHaveCount(1);
+  const members = page.locator('#topology-stage .stage-mirror-member');
+  await expect(members).toHaveCount(2);
+
+  for (let i = 0; i < 2; i++) {
+    const box = await members.nth(i).boundingBox();
+    expect(box).not.toBeNull();
+    const hitSelf = await members.nth(i).evaluate((el, pt) => {
+      const hit = document.elementFromPoint(pt.x, pt.y);
+      return hit === el || el.contains(hit);
+    }, { x: box.x + box.width / 2, y: box.y + box.height / 2 });
+    expect(hitSelf).toBe(true);
+    await members.nth(i).click();
+  }
+
+  await expect.poll(() => mock.actions.length).toBe(2);
+  expect(mock.actions).toEqual([
+    { action: 'toggle_monitor', stable_key: 'display#internal#1' },
+    { action: 'toggle_monitor', stable_key: 'display#ext#2' },
+  ]);
+});
+
+test('timed layout preview supports Keep/Revert and theme toggle persists via set_theme', async ({ page }) => {
+  const mock = await setup(page);
+  await page.locator('input[name="color_scheme"][value="dark"]').check();
+  await expect.poll(() => mock.actions.length).toBe(1);
+  expect(mock.actions[0]).toEqual({ action: 'set_theme', theme: 'dark' });
+
+  await page.locator('#btn-new-config').click();
+  await page.locator('#cfg-label').fill('Preview Profile');
+  await page.locator('#monitor-matrix .matrix-row').nth(1).locator('[value="include"]').check();
+
+  await page.locator('#btn-test-config').click();
+  await expect(page.locator('#config-preview-bar')).toBeVisible();
+  await expect.poll(() => mock.actions.length).toBe(2);
+  expect(mock.actions[1].action).toBe('apply_preview');
+
+  await page.locator('#btn-keep-preview').click();
+  await expect(page.locator('#config-preview-bar')).not.toBeVisible();
+  expect(mock.actions).toHaveLength(2);
+
+  await page.locator('#btn-test-config').click();
+  await expect(page.locator('#config-preview-bar')).toBeVisible();
+  await page.locator('#btn-revert-preview').click();
+  await expect(page.locator('#config-preview-bar')).not.toBeVisible();
+  await expect.poll(() => mock.actions.length).toBe(4);
+  expect(mock.actions[3]).toEqual({ action: 'wake_all' });
 });
 
 for (const theme of ['light', 'dark']) {

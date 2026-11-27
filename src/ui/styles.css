@@ -542,6 +542,61 @@ body {
   color: var(--on-muted);
 }
 
+.stage-monitor-group {
+  position: absolute;
+  z-index: 2;
+  border-radius: 8px;
+  border: 2px solid var(--primary);
+  background: var(--primary-soft);
+  color: var(--on-surface);
+  padding: 0.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  overflow: hidden;
+}
+
+.stage-monitor-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.3rem;
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 0 0.15rem;
+}
+
+.stage-mirror-members {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(0, 1fr));
+  gap: 0.25rem;
+  flex: 1;
+  min-height: 0;
+}
+
+.stage-mirror-member {
+  border-radius: 6px;
+  border: 1px solid var(--outline);
+  background: var(--surface);
+  color: var(--on-surface);
+  padding: 0.2rem 0.3rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  cursor: pointer;
+  overflow: hidden;
+  min-width: 0;
+  font: inherit;
+}
+
+.stage-mirror-member.is-off {
+  border-style: dashed;
+  color: var(--on-muted);
+  background: var(--surface-high);
+}
+
 .stage-monitor-title {
   font-size: 0.76rem;
   font-weight: 700;
@@ -1184,6 +1239,29 @@ dialog::backdrop {
 .outcome-label {
   font-weight: 650;
   min-width: 78px;
+}
+
+.preview-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 0.75rem;
+  padding: 0.6rem 0.85rem;
+  border-radius: 10px;
+  border: 1px solid var(--primary);
+  background: var(--primary-soft);
+  font-size: 0.83rem;
+}
+
+.preview-bar[hidden] {
+  display: none;
+}
+
+.preview-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
 }
 
 .dialog-footer {

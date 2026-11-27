@@ -395,7 +395,7 @@ pub fn run_recovery(
     }
 
     let summary = format!(
-        "Recovery {:?} complete in {}ms [s1={}ms, s2={}ms, s3={}ms, s4={}ms(gdi={}ms,max_win={}ms,thr={})]: active={}, topology_restored={}, relaxed={}, retrained={}, bounced={}, windows_restored={}",
+        "Recovery {:?} complete in {}ms [s1={}ms, s2={}ms, s3={}ms, s4={}ms(gdi={}ms,max_win={}ms,thr={},failed={})]: active={}, topology_restored={}, relaxed={}, retrained={}, bounced={}, windows_restored={}",
         level,
         total_ms,
         stage1_ms,
@@ -405,6 +405,7 @@ pub fn run_recovery(
         stage4_gdi_wait_ms,
         restore_stats.max_window_ms,
         restore_stats.threads_used,
+        restore_stats.failed,
         live_after_stage2.len(),
         topology_restored,
         used_relaxed_timings,

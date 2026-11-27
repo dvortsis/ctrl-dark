@@ -1,8 +1,30 @@
 (() => {
   'use strict';
 
-  const SESSION_TOKEN =
-    document.querySelector('meta[name="mt-session-token"]')?.getAttribute('content') || '';
+  let SESSION_TOKEN = '';
+  (() => {
+    const metaEl = document.querySelector('meta[name="mt-session-token"]');
+    const metaToken = (metaEl?.getAttribute('content') || '').trim();
+    if (metaToken && metaToken !== '__MT_SESSION_TOKEN__') {
+      SESSION_TOKEN = metaToken;
+      try {
+        sessionStorage.setItem('mt_api_token', metaToken);
+      } catch (_) {}
+    } else {
+      try {
+        SESSION_TOKEN = sessionStorage.getItem('mt_api_token') || '';
+      } catch (_) {}
+    }
+    try {
+      const url = new URL(window.location.href);
+      if (url.searchParams.has('launch') || url.searchParams.has('token')) {
+        url.searchParams.delete('launch');
+        url.searchParams.delete('token');
+        const query = url.searchParams.toString();
+        window.history.replaceState(null, '', url.pathname + (query ? `?${query}` : '') + url.hash);
+      }
+    } catch (_) {}
+  })();
 
   let appState = null;
   let editingIndex = null; // null = create new, integer = edit existing
@@ -23,12 +45,24 @@
   let builderMonitors = [];
   let builderConfig = null;
   let settingsBase = null;
+  let settingsAutostartBase = false;
   let deleteBase = null;
+  let localThemeOverride = null;
+  let previewRevertTimer = null;
+  let previewCountdownTimer = null;
+  let previewActive = false;
+  let previewRemaining = 0;
+  const ALERT_ORDER = ['connection', 'lock', 'recovery', 'action', 'hotkey'];
+  const activeAlerts = new Map();
+  const dismissedAlerts = new Map();
+  let currentAlertSource = '';
   let currentAlertKey = '';
-  let dismissedAlertKey = '';
 
   function markSettingsDirty() {
-    if (!settingsDirty && appState) settingsBase = structuredClone(appState.config);
+    if (!settingsDirty && appState) {
+      settingsBase = structuredClone(appState.config);
+      settingsAutostartBase = Boolean(appState.autostart);
+    }
     settingsDirty = true;
     document.getElementById('settings-dirty-hint').textContent = 'Unsaved changes';
   }
@@ -49,7 +83,23 @@
     }
   }
 
+  function isDisplayActionButton(button) {
+    if (
+      button.id === 'btn-wake-all' ||
+      button.id === 'btn-force-recover' ||
+      button.id === 'btn-toggle-all' ||
+      button.id === 'btn-toggle-externals' ||
+      button.id === 'btn-snapshot' ||
+      button.id === 'btn-test-config'
+    ) {
+      return true;
+    }
+    if (button.closest('#topology-stage') || button.closest('#monitors-list')) return true;
+    return button.dataset.displayAction === 'true';
+  }
+
   function syncControls() {
+    const recovering = appState?.status?.state === 'recovering';
     document.querySelectorAll('button').forEach((button) => {
       if (button.id === 'btn-refresh' || button.id === 'btn-dismiss-alert' ||
           button.closest('#delete-dialog')) return;
@@ -57,7 +107,13 @@
         button.disabled = submissionBusy;
         return;
       }
-      button.disabled = !connected || configBusy || submissionBusy || actionBusy || button.dataset.offline === 'true';
+      button.disabled =
+        !connected ||
+        configBusy ||
+        submissionBusy ||
+        actionBusy ||
+        button.dataset.offline === 'true' ||
+        (recovering && isDisplayActionButton(button));
     });
     const snapshot = document.getElementById('btn-snapshot');
     snapshot.disabled ||= appState?.status.state !== 'active_on';
@@ -68,17 +124,28 @@
     document.getElementById('config-form').inert = submissionBusy;
   }
 
-
-  // Theme management (dark-mode & dark-mode-toggle)
+  // Theme management (server preference + localStorage fallback when system)
   const colorSchemeMeta = document.querySelector('meta[name="color-scheme"]');
   const darkMedia = window.matchMedia('(prefers-color-scheme: dark)');
 
-  function syncThemeUI() {
+  function currentThemeMode() {
+    if (localThemeOverride === 'light' || localThemeOverride === 'dark' || localThemeOverride === 'system') {
+      return localThemeOverride;
+    }
+    const cfgTheme = appState?.config?.theme;
+    if (cfgTheme === 'light' || cfgTheme === 'dark') {
+      return cfgTheme;
+    }
     let stored = null;
     try {
       stored = localStorage.getItem('color-scheme');
     } catch (_) {}
-    const mode = stored === 'light' || stored === 'dark' ? stored : 'system';
+    if (stored === 'light' || stored === 'dark') return stored;
+    return cfgTheme === 'system' ? 'system' : 'system';
+  }
+
+  function syncThemeUI() {
+    const mode = currentThemeMode();
     if (colorSchemeMeta) {
       colorSchemeMeta.content = mode === 'system' ? 'light dark' : mode;
     }
@@ -98,12 +165,16 @@
   });
 
   window.addEventListener('storage', (e) => {
-    if (e.key === 'color-scheme') syncThemeUI();
+    if (e.key === 'color-scheme') {
+      localThemeOverride = null;
+      syncThemeUI();
+    }
   });
 
   document.querySelectorAll('input[name="color_scheme"]').forEach((radio) => {
     radio.addEventListener('change', () => {
       if (!radio.checked) return;
+      localThemeOverride = radio.value;
       try {
         if (radio.value === 'system') {
           localStorage.removeItem('color-scheme');
@@ -111,7 +182,15 @@
           localStorage.setItem('color-scheme', radio.value);
         }
       } catch (_) {}
+      if (appState?.config) appState.config.theme = radio.value;
+      if (settingsBase) settingsBase.theme = radio.value;
       syncThemeUI();
+      if (connected) {
+        apiFetch('/api/action', {
+          method: 'POST',
+          body: JSON.stringify({ action: 'set_theme', theme: radio.value }),
+        }).catch(() => {});
+      }
     });
   });
 
@@ -150,22 +229,51 @@
     announce(msg);
   }
 
-  function showAlert(msg, isError = true) {
+  function renderTopAlert() {
     const banner = document.getElementById('alert-banner');
     const prefix = document.getElementById('alert-prefix');
     const text = document.getElementById('alert-text');
+    if (!banner || !text) return;
+    for (const source of ALERT_ORDER) {
+      const entry = activeAlerts.get(source);
+      if (!entry) continue;
+      const key = `${entry.isError ? 'err' : 'warn'}:${entry.msg}`;
+      if (dismissedAlerts.get(source) === key) continue;
+      currentAlertSource = source;
+      currentAlertKey = key;
+      if (prefix) prefix.textContent = entry.isError ? 'Error: ' : 'Warning: ';
+      text.textContent = entry.msg;
+      banner.classList.toggle('is-error', entry.isError);
+      banner.hidden = false;
+      return;
+    }
+    currentAlertSource = '';
+    currentAlertKey = '';
+    banner.hidden = true;
+  }
+
+  function setAlertSource(source, msg, isError = true) {
+    if (!msg) {
+      activeAlerts.delete(source);
+      dismissedAlerts.delete(source);
+    } else {
+      const key = `${isError ? 'err' : 'warn'}:${msg}`;
+      if (dismissedAlerts.get(source) !== key) {
+        dismissedAlerts.delete(source);
+      }
+      activeAlerts.set(source, { isError, msg });
+    }
+    renderTopAlert();
+  }
+
+  function showAlert(msg, isError = true) {
     const modalAlert = document.querySelector('dialog[open] .dialog-alert');
     if (modalAlert) {
       modalAlert.textContent = msg;
       modalAlert.hidden = false;
       return;
     }
-    if (!banner || !text) return;
-    currentAlertKey = `${isError ? 'err' : 'warn'}:${msg}`;
-    if (prefix) prefix.textContent = isError ? 'Error: ' : 'Warning: ';
-    text.textContent = msg;
-    banner.classList.toggle('is-error', isError);
-    banner.hidden = false;
+    setAlertSource('action', msg, isError);
   }
 
   function hideAlert() {
@@ -325,30 +433,27 @@
       connected = true;
       appState = data;
       renderAll();
-      if (data.status?.hotkey_warnings?.length) {
-        const msg = `Hotkey warning: ${data.status.hotkey_warnings.join(' | ')}`;
-        const key = `warn:${msg}`;
-        if (dismissedAlertKey !== key) {
-          dismissedAlertKey = '';
-          showAlert(msg, false);
-        }
-      } else if (data.status?.last_recovery_summary?.startsWith('Error:')) {
-        const msg = data.status.last_recovery_summary;
-        const key = `err:${msg}`;
-        if (dismissedAlertKey !== key) {
-          dismissedAlertKey = '';
-          showAlert(msg, true);
-        }
-      } else {
-        dismissedAlertKey = '';
-        currentAlertKey = '';
-        hideAlert();
-      }
+      setAlertSource('connection', '');
+      setAlertSource('lock', data.status?.last_lock_error || '', true);
+      setAlertSource(
+        'recovery',
+        data.status?.last_recovery_summary?.startsWith('Error:')
+          ? data.status.last_recovery_summary
+          : '',
+        true
+      );
+      setAlertSource(
+        'hotkey',
+        data.status?.hotkey_warnings?.length
+          ? `Hotkey warning: ${data.status.hotkey_warnings.join(' | ')}`
+          : '',
+        false
+      );
     } catch (err) {
       if (version !== stateVersion) return;
       connected = false;
       document.getElementById('phase-badge').textContent = 'Disconnected';
-      showAlert(`Cannot reach the daemon. ${err.message}`, true);
+      setAlertSource('connection', `Cannot reach the daemon. ${err.message}`, true);
     } finally {
       refreshing = false;
       syncControls();
@@ -357,6 +462,7 @@
 
   function renderAll() {
     if (!appState) return;
+    syncThemeUI();
     renderHeader();
     const focusKey = document.activeElement?.dataset.focusKey;
     const nextMonitors = JSON.stringify([appState.monitors, appState.status.state]);
@@ -395,8 +501,13 @@
     badge.textContent = p.text;
     badge.className = `status-pill ${p.cls}`;
     const asleep = ['locked_off', 'sleeping_normal'].includes(status.state);
+    const failed = status.state === 'recovery_failed';
     summary.textContent = asleep ? 'All displays sleeping' : `${status.active_monitors} / ${status.total_available_monitors} displays active`;
-    document.getElementById('btn-toggle-all').textContent = asleep ? 'Wake All' : 'Sleep All';
+    document.getElementById('btn-toggle-all').textContent = failed
+      ? 'Retry Recovery'
+      : asleep
+        ? 'Wake All'
+        : 'Sleep All';
 
     const snapMeta = document.getElementById('snapshot-meta');
     if (status.snapshot_monitors > 0) {
@@ -453,43 +564,111 @@
     const offsetX = (stageW - totalW * scale) / 2;
     const offsetY = (stageH - totalH * scale) / 2;
 
+    const groups = [];
+    const groupByGeom = new Map();
     monitors.forEach((m, idx) => {
-      const [x, y] = m.position;
-      const [w, h] = m.resolution;
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = `stage-monitor${m.active ? '' : ' is-off'}`;
-      btn.style.left = `${offsetX + (x - minX) * scale}px`;
-      btn.style.top = `${offsetY + (y - minY) * scale}px`;
-      btn.style.width = `${Math.max(42, w * scale - 3)}px`;
-      btn.style.height = `${Math.max(28, h * scale - 3)}px`;
-      btn.dataset.offline = String(!m.available);
-      btn.dataset.focusKey = `stage:${m.stable_key}`;
-      btn.disabled = !m.available;
-      const accessibleAction = !m.available
+      const key = `${m.position[0]}:${m.position[1]}:${m.resolution[0]}:${m.resolution[1]}`;
+      let list = groupByGeom.get(key);
+      if (!list) {
+        list = [];
+        groupByGeom.set(key, list);
+        groups.push(list);
+      }
+      list.push({ mon: m, idx });
+    });
+
+    const buildStageActionLabel = (m) =>
+      !m.available
         ? `${m.friendly_name} (disconnected)`
         : allDisplaysSleeping()
           ? `Wake All displays (including ${m.friendly_name})`
           : m.active
             ? `Turn Off ${m.friendly_name}`
             : `Restore All displays (including ${m.friendly_name})`;
-      btn.setAttribute('aria-label', accessibleAction);
-      btn.title = m.available
-        ? `Toggle ${m.friendly_name} (${m.active ? 'currently ON' : 'currently OFF'})`
-        : `${m.friendly_name} (disconnected)`;
 
-      const name = document.createElement('span');
-      name.className = 'stage-monitor-title';
-      name.textContent = `${idx + 1}. ${m.friendly_name}`;
+    for (const group of groups) {
+      const first = group[0].mon;
+      const [x, y] = first.position;
+      const [w, h] = first.resolution;
+      const boxLeft = offsetX + (x - minX) * scale;
+      const boxTop = offsetY + (y - minY) * scale;
+      const boxW = Math.max(group.length > 1 ? 110 : 42, w * scale - 3);
+      const boxH = Math.max(group.length > 1 ? 56 : 28, h * scale - 3);
 
-      const sub = document.createElement('span');
-      sub.className = 'stage-monitor-sub tabular-nums';
-      sub.textContent = !m.available ? 'Unplugged' : allDisplaysSleeping() ? 'Sleeping' : m.active ? `${w}×${h}` : 'OFF';
+      if (group.length === 1) {
+        const m = first;
+        const { idx } = group[0];
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = `stage-monitor${m.active ? '' : ' is-off'}`;
+        btn.style.left = `${boxLeft}px`;
+        btn.style.top = `${boxTop}px`;
+        btn.style.width = `${boxW}px`;
+        btn.style.height = `${boxH}px`;
+        btn.dataset.offline = String(!m.available);
+        btn.dataset.displayAction = 'true';
+        btn.dataset.focusKey = `stage:${m.stable_key}`;
+        btn.disabled = !m.available;
+        btn.setAttribute('aria-label', buildStageActionLabel(m));
+        btn.title = m.available
+          ? `Toggle ${m.friendly_name} (${m.active ? 'currently ON' : 'currently OFF'})`
+          : `${m.friendly_name} (disconnected)`;
 
-      btn.append(name, sub);
-      btn.addEventListener('click', () => runAction({ action: 'toggle_monitor', stable_key: m.stable_key }));
-      stage.append(btn);
-    });
+        const name = document.createElement('span');
+        name.className = 'stage-monitor-title';
+        name.textContent = `${idx + 1}. ${m.friendly_name}`;
+
+        const sub = document.createElement('span');
+        sub.className = 'stage-monitor-sub tabular-nums';
+        sub.textContent = !m.available ? 'Unplugged' : allDisplaysSleeping() ? 'Sleeping' : m.active ? `${w}×${h}` : 'OFF';
+
+        btn.append(name, sub);
+        btn.addEventListener('click', () => runAction({ action: 'toggle_monitor', stable_key: m.stable_key }));
+        stage.append(btn);
+      } else {
+        const wrap = document.createElement('div');
+        wrap.className = 'stage-monitor-group';
+        wrap.style.left = `${boxLeft}px`;
+        wrap.style.top = `${boxTop}px`;
+        wrap.style.width = `${boxW}px`;
+        wrap.style.height = `${boxH}px`;
+
+        const head = document.createElement('div');
+        head.className = 'stage-monitor-group-head';
+        const badge = document.createElement('span');
+        badge.textContent = `Mirrored (${group.length})`;
+        const dim = document.createElement('span');
+        dim.className = 'tabular-nums';
+        dim.textContent = `${w}×${h}`;
+        head.append(badge, dim);
+
+        const members = document.createElement('div');
+        members.className = 'stage-mirror-members';
+        for (const { mon: m, idx } of group) {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = `stage-mirror-member${m.active ? '' : ' is-off'}`;
+          btn.dataset.offline = String(!m.available);
+          btn.dataset.displayAction = 'true';
+          btn.dataset.focusKey = `stage:${m.stable_key}`;
+          btn.disabled = !m.available;
+          btn.setAttribute('aria-label', buildStageActionLabel(m));
+
+          const title = document.createElement('span');
+          title.className = 'stage-monitor-title';
+          title.textContent = `${idx + 1}. ${m.friendly_name}`;
+          const st = document.createElement('span');
+          st.className = 'stage-monitor-sub';
+          st.textContent = !m.available ? 'Unplugged' : allDisplaysSleeping() ? 'Sleeping' : m.active ? 'ON' : 'OFF';
+          btn.append(title, st);
+          btn.addEventListener('click', () => runAction({ action: 'toggle_monitor', stable_key: m.stable_key }));
+          members.append(btn);
+        }
+
+        wrap.append(head, members);
+        stage.append(wrap);
+      }
+    }
   }
 
   function renderMonitorCards() {
@@ -660,6 +839,7 @@
       const btnRun = document.createElement('button');
       btnRun.type = 'button';
       btnRun.className = 'btn btn-tonal btn-sm';
+      btnRun.dataset.displayAction = 'true';
       btnRun.textContent = isActive && rule.action !== 'off' ? 'Restore All' : rule.action === 'off' ? 'Turn Off' : 'Toggle Now';
       btnRun.addEventListener('click', () => runAction({ action: 'toggle_rule', index, expected_rule: rule }));
 
@@ -702,7 +882,8 @@
     });
 
     const rec = cfg.recovery || {};
-    document.getElementById('opt-autostart').checked = Boolean(appState.autostart);
+    settingsAutostartBase = Boolean(appState.autostart);
+    document.getElementById('opt-autostart').checked = settingsAutostartBase;
     document.getElementById('opt-start-minimized').checked = cfg.start_minimized_to_tray ?? true;
     document.getElementById('opt-lock-on-sleep').checked = Boolean(cfg.lock_workstation_on_sleep);
     document.getElementById('opt-wake-on-unlock').checked = Boolean(cfg.wake_on_session_unlock);
@@ -748,6 +929,7 @@
         method: 'POST',
         body: JSON.stringify(payload),
       });
+      setAlertSource('action', '');
       if (resp.state) {
         appState = resp.state;
         renderAll();
@@ -873,7 +1055,27 @@
   const configForm = document.getElementById('config-form');
   const deleteDialog = document.getElementById('delete-dialog');
 
-  // Guard modal Esc while recording shortcut & reset returnValue on close (dialog guidance)
+  // Guard modal Esc while recording shortcut, revert unkept previews on close & reset returnValue
+  function clearPreviewTimers(hideBar = true) {
+    clearTimeout(previewRevertTimer);
+    clearInterval(previewCountdownTimer);
+    previewRevertTimer = null;
+    previewCountdownTimer = null;
+    if (hideBar) {
+      const bar = document.getElementById('config-preview-bar');
+      if (bar) bar.hidden = true;
+    }
+  }
+
+  function revertActivePreview() {
+    if (!previewActive) return;
+    previewActive = false;
+    clearPreviewTimers(true);
+    if (connected) {
+      runAction({ action: 'wake_all' });
+    }
+  }
+
   configDialog.addEventListener('cancel', (e) => {
     if (submissionBusy) { e.preventDefault(); return; }
     if (recordingInput) {
@@ -885,6 +1087,12 @@
     stopHotkeyRecording(true);
     const statusEl = document.getElementById('config-status');
     if (statusEl) statusEl.hidden = true;
+    if (configDialog.returnValue !== 'saved') {
+      revertActivePreview();
+    } else {
+      previewActive = false;
+      clearPreviewTimers(true);
+    }
     configDialog.returnValue = '';
   });
   deleteDialog.addEventListener('close', () => {
@@ -929,6 +1137,8 @@
   function openConfigDialog(idx, prefillRule = null) {
     if (!appState) return;
     stopHotkeyRecording(true);
+    previewActive = false;
+    clearPreviewTimers(true);
     editingIndex = idx;
     builderMonitors = structuredClone(appState.monitors);
     builderConfig = structuredClone(appState.config);
@@ -969,27 +1179,34 @@
 
     builderMonitors.forEach((mon, monIdx) => {
       const token = monitorSelectorToken(mon);
-      const isInc = (rule.include || []).some((s) => {
+      const rowIncSelectors = [];
+      for (const s of rule.include || []) {
         if (isLiteralMonitorSelector(s, mon)) {
           matchedInc.add(s);
-          return true;
+          rowIncSelectors.push(s);
         }
-        return false;
-      });
-      const isExc = (rule.exclude || []).some((s) => {
+      }
+      const rowExcSelectors = [];
+      for (const s of rule.exclude || []) {
         if (isLiteralMonitorSelector(s, mon)) {
           matchedExc.add(s);
-          return true;
+          rowExcSelectors.push(s);
         }
-        return false;
-      });
+      }
       // Precedence if somehow both matched: exclude wins visually
-      const initialMode = isExc ? 'exclude' : isInc ? 'include' : 'auto';
+      const initialMode = rowExcSelectors.length
+        ? 'exclude'
+        : rowIncSelectors.length
+          ? 'include'
+          : 'auto';
 
       const row = document.createElement('div');
       row.className = 'matrix-row';
       row.dataset.token = token;
       row.dataset.monIndex = String(monIdx);
+      row.dataset.initialMode = initialMode;
+      row.dataset.initialIncSelectors = JSON.stringify(rowIncSelectors);
+      row.dataset.initialExcSelectors = JSON.stringify(rowExcSelectors);
 
       const left = document.createElement('div');
       left.className = 'matrix-mon-info';
@@ -1048,6 +1265,16 @@
       const token = row.dataset.token;
       const checked = row.querySelector(`input[name="mon_mode_${idx}"]:checked`);
       const mode = checked ? checked.value : 'auto';
+      if (mode === row.dataset.initialMode) {
+        if (mode === 'include') {
+          const orig = JSON.parse(row.dataset.initialIncSelectors || '[]');
+          include.push(...(orig.length ? orig : [token]));
+        } else if (mode === 'exclude') {
+          const orig = JSON.parse(row.dataset.initialExcSelectors || '[]');
+          exclude.push(...(orig.length ? orig : [token]));
+        }
+        return;
+      }
       if (mode === 'include') include.push(token);
       else if (mode === 'exclude') exclude.push(token);
     });
@@ -1186,16 +1413,50 @@
       return;
     }
     const action = document.querySelector('input[name="cfg_action"]:checked')?.value || 'toggle';
+    clearPreviewTimers(true);
     await runAction({
       action: 'apply_preview',
       include,
       exclude,
       off_only: action === 'off',
     });
+    if (document.getElementById('config-alert')?.hidden) {
+      previewActive = true;
+      previewRemaining = 15;
+      const bar = document.getElementById('config-preview-bar');
+      const txt = document.getElementById('config-preview-text');
+      if (bar && txt) {
+        txt.textContent = `Preview active. Reverting automatically in ${previewRemaining}s…`;
+        bar.hidden = false;
+      }
+      previewCountdownTimer = setInterval(() => {
+        previewRemaining = Math.max(0, previewRemaining - 1);
+        if (txt) {
+          txt.textContent = `Preview active. Reverting automatically in ${previewRemaining}s…`;
+        }
+        if (previewRemaining === 0) {
+          clearInterval(previewCountdownTimer);
+          previewCountdownTimer = null;
+        }
+      }, 1000);
+      previewRevertTimer = setTimeout(() => {
+        revertActivePreview();
+      }, 15000);
+    }
+  });
+
+  document.getElementById('btn-keep-preview').addEventListener('click', () => {
+    previewActive = false;
+    clearPreviewTimers(true);
+    showToast('Keeping tested layout preview');
+  });
+
+  document.getElementById('btn-revert-preview').addEventListener('click', () => {
+    revertActivePreview();
   });
 
   document.getElementById('btn-close-config-dialog').addEventListener('click', () => {
-    configDialog.close('');
+    configDialog.close('cancel');
   });
   document.getElementById('btn-cancel-config').addEventListener('click', () => {
     configDialog.close('cancel');
@@ -1427,18 +1688,24 @@
       document.getElementById('opt-audio-cue').checked;
 
     const wantAutostart = document.getElementById('opt-autostart').checked;
+    const payload = { config: nextCfg, expected_config: expectedConfig };
+    if (wantAutostart !== settingsAutostartBase) {
+      payload.autostart = wantAutostart;
+      payload.expected_autostart = settingsAutostartBase;
+    }
     const submitBtn = document.getElementById('btn-save-settings');
     submitBtn.disabled = true;
     try {
       const updated = await apiFetch('/api/config', {
         method: 'POST',
-        body: JSON.stringify({ config: nextCfg, expected_config: expectedConfig, autostart: wantAutostart }),
+        body: JSON.stringify(payload),
       });
       appState = updated;
       renderAll();
       settingsDirty = false;
       settingsBase = null;
       populateSettingsForm();
+      setAlertSource('action', '');
       showToast('Settings saved and hotkeys reloaded');
     } catch (err) {
       if (/shortcut|hotkey/i.test(err.message)) {
@@ -1466,7 +1733,16 @@
     runAction({ action: 'recover', hard: true })
   );
   document.getElementById('btn-refresh').addEventListener('click', refreshState);
-  document.getElementById('btn-toggle-all').addEventListener('click', () => runAction({ action: 'toggle_all' }));
+  document.getElementById('btn-toggle-all').addEventListener('click', () => {
+    const st = appState?.status?.state;
+    if (st === 'recovery_failed') {
+      runAction({ action: 'recover', hard: false });
+    } else if (['locked_off', 'sleeping_normal'].includes(st)) {
+      runAction({ action: 'wake_all' });
+    } else {
+      runAction({ action: 'sleep_all' });
+    }
+  });
   document.getElementById('btn-toggle-externals').addEventListener('click', () =>
     runAction({ action: 'toggle_externals' })
   );
@@ -1480,8 +1756,10 @@
     runAction({ action: installed ? 'remove_shortcuts' : 'install_shortcuts', start_menu: false, desktop: true });
   });
   document.getElementById('btn-dismiss-alert').addEventListener('click', () => {
-    dismissedAlertKey = currentAlertKey;
-    hideAlert();
+    if (currentAlertSource && currentAlertKey) {
+      dismissedAlerts.set(currentAlertSource, currentAlertKey);
+    }
+    renderTopAlert();
   });
 
   window.addEventListener('resize', () => {

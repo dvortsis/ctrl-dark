@@ -49,8 +49,9 @@ pub fn launch_ui_window(ui_url: Option<&str>, force_browser: bool) -> Result<(),
     }
 
     let url = ui_url.ok_or_else(|| "Control Panel web URL is not yet available".to_string())?;
+    let validated_url = crate::ipc::validate_loopback_ui_url(url)?;
     let op_w = to_wide_null("open");
-    let url_w = to_wide_null(url);
+    let url_w = to_wide_null(&validated_url);
     let rc = unsafe {
         ShellExecuteW(
             null_mut(),
