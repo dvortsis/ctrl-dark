@@ -372,6 +372,30 @@ pub fn run_recovery(
     if let Some(saved) = snapshot {
         let available = query_available_targets()?;
         if needs_topology_restore(saved, &live_after_stage2, &available) {
+            let live_desc: Vec<String> = live_after_stage2
+                .iter()
+                .map(|d| {
+                    format!(
+                        "{}({}@({},{}),{}x{})",
+                        d.friendly_name,
+                        if d.active { "on" } else { "off" },
+                        d.position.0,
+                        d.position.1,
+                        d.resolution.0,
+                        d.resolution.1
+                    )
+                })
+                .collect();
+            let avail_desc: Vec<String> = available
+                .iter()
+                .filter(|t| t.target_available)
+                .map(|t| format!("{}(act={})", t.friendly_name, t.is_active))
+                .collect();
+            logging::warn(format!(
+                "Recovery topology mismatch check failed: live=[{}], available=[{}]",
+                live_desc.join("; "),
+                avail_desc.join("; ")
+            ));
             return Err("Recovery could not restore the saved layout of the connected displays. Check connections and try Force Recover.".into());
         }
     }

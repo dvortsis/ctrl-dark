@@ -193,6 +193,35 @@ pub fn load_snapshot(path: &Path) -> Result<Option<TopologySnapshot>, String> {
     Ok(Some(snap))
 }
 
+fn planned_rects_are_contiguous(rects: &[(i32, i32, i32, i32)]) -> bool {
+    if rects.len() <= 1 {
+        return true;
+    }
+    let touches_or_overlaps = |a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)| {
+        let (al, at, ar, ab) = a;
+        let (bl, bt, br, bb) = b;
+        let v_edge = (ar == bl || br == al) && at <= bb && bt <= ab;
+        let h_edge = (ab == bt || bb == at) && al <= br && bl <= ar;
+        let overlap = al < br && bl < ar && at < bb && bt < ab;
+        v_edge || h_edge || overlap
+    };
+    let mut visited = vec![false; rects.len()];
+    let mut queue = std::collections::VecDeque::new();
+    visited[0] = true;
+    queue.push_back(0);
+    let mut seen = 0usize;
+    while let Some(idx) = queue.pop_front() {
+        seen += 1;
+        for next in 0..rects.len() {
+            if !visited[next] && touches_or_overlaps(rects[idx], rects[next]) {
+                visited[next] = true;
+                queue.push_back(next);
+            }
+        }
+    }
+    seen == rects.len()
+}
+
 /// Compares live displays against the same identity matching, clone groups and
 /// reanchored origin used by the restore planner (including connector fallback).
 pub fn needs_topology_restore(
@@ -213,6 +242,27 @@ pub fn needs_topology_restore(
             })
         });
     };
+    let planned_rects: Vec<(i32, i32, i32, i32)> = plan
+        .paths
+        .iter()
+        .map(|path| {
+            let mode = &plan.modes[source_mode_index(path).expect("planned source mode")];
+            let source = unsafe { mode.Anonymous.sourceMode };
+            (
+                source.position.x,
+                source.position.y,
+                source.position.x.saturating_add_unsigned(source.width),
+                source.position.y.saturating_add_unsigned(source.height),
+            )
+        })
+        .collect();
+    // When bridge monitors are unplugged and leave coordinate gaps, SetDisplayConfig with
+    // SDC_ALLOW_CHANGES snaps the surviving monitors into a contiguous layout; avoid failing
+    // verification on that Windows-adjusted gap offset while still enforcing active state,
+    // resolution, rotation, and refresh rate.
+    let enforce_exact_positions =
+        plan.skipped_unplugged_keys.is_empty() || planned_rects_are_contiguous(&planned_rects);
+
     for path in &plan.paths {
         let Some(target) = available_targets.iter().find(|target| {
             target.target_id == path.targetInfo.id
@@ -233,7 +283,7 @@ pub fn needs_topology_restore(
         let mode = &plan.modes[source_mode_index(path).expect("planned source mode")];
         let source = unsafe { mode.Anonymous.sourceMode };
         if live.resolution != (source.width, source.height)
-            || live.position != (source.position.x, source.position.y)
+            || (enforce_exact_positions && live.position != (source.position.x, source.position.y))
             || live.rotation != path.targetInfo.rotation as u32
         {
             return true;
@@ -1084,5 +1134,119 @@ mod tests {
             plan.newly_activated_keys,
             vec!["display#len8aa5#uid8388688"]
         );
+    }
+
+    #[test]
+    fn needs_topology_restore_tolerates_windows_gap_snap_when_bridge_monitors_are_unplugged() {
+        let luid = LUID {
+            LowPart: 0x1000,
+            HighPart: 0,
+        };
+        let base = &sample_snapshot().monitors[0];
+        let snap = TopologySnapshot {
+            captured_at_unix_ms: 1,
+            monitors: vec![
+                SavedMonitorMode {
+                    stable_key: "display#boe2775#uid8261".into(),
+                    friendly_name: "J560T09".into(),
+                    role: DisplayRole::External,
+                    position_x: -2566,
+                    position_y: -1442,
+                    width: 2560,
+                    height: 1600,
+                    ..base.clone()
+                },
+                SavedMonitorMode {
+                    stable_key: "display#len61e9#uid12613".into(),
+                    friendly_name: "P27h-20".into(),
+                    role: DisplayRole::External,
+                    position_x: -2560,
+                    position_y: 158,
+                    width: 2560,
+                    height: 1440,
+                    ..base.clone()
+                },
+                SavedMonitorMode {
+                    stable_key: "display#aus1641#uid256".into(),
+                    friendly_name: "ASUS MB16AC".into(),
+                    role: DisplayRole::UsbIndirect,
+                    position_x: -6,
+                    position_y: -1080,
+                    width: 1920,
+                    height: 1080,
+                    ..base.clone()
+                },
+                SavedMonitorMode {
+                    stable_key: "display#len8aa5#uid8388688".into(),
+                    friendly_name: "Internal Display".into(),
+                    role: DisplayRole::Internal,
+                    position_x: 0,
+                    position_y: 0,
+                    width: 2560,
+                    height: 1600,
+                    ..base.clone()
+                },
+            ],
+        };
+
+        let mut int_target = target_for(&snap.monitors[3], 4, vec![0, 1]);
+        int_target.adapter_id = luid;
+        let mut j560_target = target_for(&snap.monitors[0], 1, vec![0, 1]);
+        j560_target.adapter_id = luid;
+        j560_target.is_active = true;
+        j560_target.active_source_id = Some(0);
+
+        // Internal is still inactive -> needs_topology_restore is true.
+        assert!(needs_topology_restore(
+            &snap,
+            &[live_for(
+                &snap.monitors[0],
+                &j560_target.stable_key,
+                (-2560, -1442)
+            )],
+            &[j560_target.clone(), int_target.clone()],
+        ));
+
+        // Internal is activated and Windows snapped J560T09 horizontally by 6px to close the gap.
+        int_target.is_active = true;
+        int_target.active_source_id = Some(1);
+        let j560_live = live_for(&snap.monitors[0], &j560_target.stable_key, (-2560, -1442));
+        let int_live = live_for(&snap.monitors[3], &int_target.stable_key, (0, 0));
+        assert!(!needs_topology_restore(
+            &snap,
+            &[j560_live, int_live.clone()],
+            &[j560_target.clone(), int_target.clone()],
+        ));
+
+        // Resolution mismatch still fails even when exact position check is relaxed for gaps.
+        let mut wrong_res = live_for(&snap.monitors[0], &j560_target.stable_key, (-2560, -1442));
+        wrong_res.resolution = (1920, 1080);
+        assert!(needs_topology_restore(
+            &snap,
+            &[wrong_res, int_live],
+            &[j560_target, int_target],
+        ));
+    }
+
+    #[test]
+    fn needs_topology_restore_enforces_exact_positions_when_all_monitors_connected() {
+        let snap = sample_snapshot();
+        let mut t0 = target_for(&snap.monitors[0], 10, vec![0, 1]);
+        t0.is_active = true;
+        t0.active_source_id = Some(0);
+        let mut t1 = target_for(&snap.monitors[1], 20, vec![0, 1]);
+        t1.is_active = true;
+        t1.active_source_id = Some(1);
+
+        let l0 = live_for(&snap.monitors[0], &t0.stable_key, (0, 0));
+        let mut l1 = live_for(&snap.monitors[1], &t1.stable_key, (2560, 0));
+        assert!(!needs_topology_restore(
+            &snap,
+            &[l0.clone(), l1.clone()],
+            &[t0.clone(), t1.clone()],
+        ));
+
+        l1.position = (2566, 0);
+        assert!(needs_topology_restore(&snap, &[l0, l1], &[t0, t1]));
     }
 }

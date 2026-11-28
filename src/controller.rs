@@ -1104,6 +1104,28 @@ impl Controller {
                 return;
             }
 
+            if self.session_locked && !other_changed && !self.selective_job_in_flight {
+                let has_reactivated = live.iter().any(|d| {
+                    d.available
+                        && d.active
+                        && self
+                            .disabled_keys
+                            .iter()
+                            .any(|k| k.eq_ignore_ascii_case(&d.stable_key))
+                });
+                let window_expired = self
+                    .last_hpd_change_at
+                    .is_none_or(|t| t.elapsed() > HPD_ENFORCE_WINDOW);
+                if has_reactivated && window_expired {
+                    self.last_hpd_change_at = Some(Instant::now());
+                    self.reenforce_attempts_for_hpd = 0;
+                    self.last_hpd_diff.clear();
+                    unsafe {
+                        SetTimer(self.hwnd as HWND, TIMER_HPD_SETTLE, 500, None);
+                    }
+                }
+            }
+
             let within_hpd_window = other_changed
                 || self
                     .last_hpd_change_at
@@ -1806,12 +1828,21 @@ fn other_topology_changed(
     let build_sig = |list: &[DisplayInfo]| {
         let mut sig: Vec<(String, bool, bool)> = list
             .iter()
-            .filter(|d| {
-                !disabled_keys
+            .filter_map(|d| {
+                let key = d.stable_key.to_ascii_lowercase();
+                let is_disabled = disabled_keys
                     .iter()
-                    .any(|k| k.eq_ignore_ascii_case(&d.stable_key))
+                    .any(|k| k.eq_ignore_ascii_case(&d.stable_key));
+                if is_disabled {
+                    // Track physical connect/disconnect transitions of disabled displays
+                    // while ignoring active-state-only changes from manual Display Settings.
+                    d.available.then_some((key, true, false))
+                } else if d.available || d.active {
+                    Some((key, d.available, d.active))
+                } else {
+                    None
+                }
             })
-            .map(|d| (d.stable_key.to_ascii_lowercase(), d.available, d.active))
             .collect();
         sig.sort();
         sig
@@ -1990,15 +2021,13 @@ fn describe_other_topology_diff(
     let state_map = |list: &[DisplayInfo]| {
         let mut map = std::collections::BTreeMap::new();
         for d in list {
-            if disabled_keys
+            let is_disabled = disabled_keys
                 .iter()
-                .any(|k| k.eq_ignore_ascii_case(&d.stable_key))
-            {
-                continue;
-            }
+                .any(|k| k.eq_ignore_ascii_case(&d.stable_key));
+            let active = if is_disabled { false } else { d.active };
             map.insert(
                 d.stable_key.to_ascii_lowercase(),
-                (d.friendly_name.clone(), d.available, d.active),
+                (d.friendly_name.clone(), d.available, active),
             );
         }
         map
@@ -2957,5 +2986,48 @@ mod tests {
             plan_selective_off(&DaemonPhase::SelectiveOff, &displays, &scope, true),
             SelectiveOffPlan::ApplyFilteredKeep(_)
         ));
+    }
+
+    #[test]
+    fn disconnecting_an_already_disabled_monitor_triggers_hpd_reenforcement() {
+        let disabled = vec![
+            "display#len8aa5#4".to_string(),
+            "display#aus1641#3".to_string(),
+        ];
+        let prev = vec![
+            make_disp("display#boe2775#1", "J560T09", DisplayRole::External, true),
+            make_disp(
+                "display#aus1641#3",
+                "ASUS MB16AC",
+                DisplayRole::UsbIndirect,
+                false,
+            ),
+            make_disp(
+                "display#len8aa5#4",
+                "Internal Display",
+                DisplayRole::Internal,
+                false,
+            ),
+        ];
+        // User physically powers off ASUS MB16AC (already in disabled_keys), causing Windows
+        // to reactivate Internal Display.
+        let curr = vec![
+            make_disp("display#boe2775#1", "J560T09", DisplayRole::External, true),
+            make_disp(
+                "display#len8aa5#4",
+                "Internal Display",
+                DisplayRole::Internal,
+                true,
+            ),
+        ];
+        assert!(other_topology_changed(&prev, &curr, &disabled));
+        assert_eq!(
+            describe_other_topology_diff(&prev, &curr, &disabled),
+            "ASUS MB16AC disconnected"
+        );
+        assert_eq!(
+            plan_selective_display_change(&curr, &disabled, true, false, 0, true, true),
+            SelectiveChangeAction::ReDeactivate(vec!["display#len8aa5#4".into()])
+        );
     }
 }
