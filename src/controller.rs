@@ -133,7 +133,8 @@ enum WorkerJob {
         target_names: String,
         trigger_vk: Option<u16>,
         lock_workstation: bool,
-        fallback_dpms_on_access_denied: bool,
+        session_locked: bool,
+        allow_dpms_fallback_on_error5: bool,
     },
     ApplyFilteredSnapshot {
         filtered_snapshot: TopologySnapshot,
@@ -215,6 +216,7 @@ pub struct Controller {
     locked_hpd_reenforce_pending: bool,
     last_hpd_change_at: Option<Instant>,
     last_hpd_diff: String,
+    last_hpd_was_disconnect: bool,
     last_reenforce_at: Option<Instant>,
     reenforce_attempts_for_hpd: u32,
     wts_registered: bool,
@@ -308,6 +310,7 @@ impl Controller {
             locked_hpd_reenforce_pending: false,
             last_hpd_change_at: None,
             last_hpd_diff: String::new(),
+            last_hpd_was_disconnect: false,
             last_reenforce_at: None,
             reenforce_attempts_for_hpd: 0,
             wts_registered,
@@ -599,6 +602,7 @@ impl Controller {
                 self.locked_hpd_reenforce_pending = false;
                 self.last_hpd_change_at = None;
                 self.last_hpd_diff.clear();
+                self.last_hpd_was_disconnect = false;
                 self.last_reenforce_at = None;
                 self.reenforce_attempts_for_hpd = 0;
                 self.phase = if wake_mode == WakeMode::HotkeyOnly {
@@ -711,7 +715,8 @@ impl Controller {
                             target_names,
                             trigger_vk,
                             lock_workstation,
-                            fallback_dpms_on_access_denied: false,
+                            session_locked: false,
+                            allow_dpms_fallback_on_error5: false,
                         });
                         self.update_tray_visual();
                     }
@@ -876,6 +881,7 @@ impl Controller {
                         if self.disabled_keys.is_empty() {
                             self.phase = DaemonPhase::ActiveOn;
                             self.last_hpd_diff.clear();
+                            self.last_hpd_was_disconnect = false;
                         }
                     }
                     self.tray_displays = live_displays;
@@ -884,6 +890,9 @@ impl Controller {
                 WorkerResult::SelectiveLockedDpmsFallback => {
                     self.selective_job_in_flight = false;
                     self.locked_hpd_reenforce_pending = true;
+                    unsafe {
+                        KillTimer(self.hwnd as HWND, TIMER_HPD_SETTLE);
+                    }
                     self.update_tray_visual();
                 }
                 WorkerResult::SelectiveNeedsFullSleep => {
@@ -985,6 +994,8 @@ impl Controller {
         match wparam {
             WTS_SESSION_LOCK => {
                 self.session_locked = true;
+                self.locked_hpd_reenforce_pending = false;
+                self.last_hpd_was_disconnect = false;
                 logging::info("Windows session locked");
             }
             WTS_SESSION_UNLOCK => {
@@ -1035,7 +1046,8 @@ impl Controller {
                             target_names: names,
                             trigger_vk: None,
                             lock_workstation: false,
-                            fallback_dpms_on_access_denied: false,
+                            session_locked: false,
+                            allow_dpms_fallback_on_error5: false,
                         });
                     } else if other_active == 0 {
                         self.disabled_keys = live
@@ -1077,10 +1089,15 @@ impl Controller {
                 }
             }
         } else if self.phase == DaemonPhase::SelectiveOff && !self.disabled_keys.is_empty() {
+            if self.session_locked && self.locked_hpd_reenforce_pending {
+                return;
+            }
             let other_changed = other_topology_changed(&prev, &live, &self.disabled_keys);
             if other_changed {
                 self.last_hpd_change_at = Some(Instant::now());
                 self.reenforce_attempts_for_hpd = 0;
+                self.last_hpd_was_disconnect =
+                    is_disconnect_or_off_hpd(&prev, &live, &self.disabled_keys);
                 let diff = describe_other_topology_diff(&prev, &live, &self.disabled_keys);
                 if !diff.is_empty() {
                     self.last_hpd_diff = diff;
@@ -1102,28 +1119,6 @@ impl Controller {
 
             if self.session_locked && self.last_console_display_state == 0 {
                 return;
-            }
-
-            if self.session_locked && !other_changed && !self.selective_job_in_flight {
-                let has_reactivated = live.iter().any(|d| {
-                    d.available
-                        && d.active
-                        && self
-                            .disabled_keys
-                            .iter()
-                            .any(|k| k.eq_ignore_ascii_case(&d.stable_key))
-                });
-                let window_expired = self
-                    .last_hpd_change_at
-                    .is_none_or(|t| t.elapsed() > HPD_ENFORCE_WINDOW);
-                if has_reactivated && window_expired {
-                    self.last_hpd_change_at = Some(Instant::now());
-                    self.reenforce_attempts_for_hpd = 0;
-                    self.last_hpd_diff.clear();
-                    unsafe {
-                        SetTimer(self.hwnd as HWND, TIMER_HPD_SETTLE, 500, None);
-                    }
-                }
             }
 
             let within_hpd_window = other_changed
@@ -1171,7 +1166,9 @@ impl Controller {
                         target_names: names,
                         trigger_vk: None,
                         lock_workstation: false,
-                        fallback_dpms_on_access_denied: self.session_locked,
+                        session_locked: self.session_locked,
+                        allow_dpms_fallback_on_error5: self.session_locked
+                            && self.last_hpd_was_disconnect,
                     });
                 }
                 SelectiveChangeAction::SyncDisabledKeys(next_disabled) => {
@@ -1183,6 +1180,7 @@ impl Controller {
                     if self.disabled_keys.is_empty() {
                         self.phase = DaemonPhase::ActiveOn;
                         self.last_hpd_diff.clear();
+                        self.last_hpd_was_disconnect = false;
                     }
                     self.update_tray_visual();
                 }
@@ -2013,11 +2011,11 @@ fn describe_keys(displays: &[DisplayInfo], keys: &[String]) -> String {
         .join(", ")
 }
 
-fn describe_other_topology_diff(
+fn topology_diff_events(
     prev_displays: &[DisplayInfo],
     curr_displays: &[DisplayInfo],
     disabled_keys: &[String],
-) -> String {
+) -> Vec<(String, &'static str)> {
     let state_map = |list: &[DisplayInfo]| {
         let mut map = std::collections::BTreeMap::new();
         for d in list {
@@ -2042,7 +2040,7 @@ fn describe_other_topology_diff(
         .into_iter()
         .collect();
     keys.sort();
-    let mut diffs = Vec::new();
+    let mut events = Vec::new();
     for key in keys {
         match (prev.get(&key), curr.get(&key)) {
             (Some((_, p_avail, p_act)), Some((name, c_avail, c_act))) => {
@@ -2056,19 +2054,43 @@ fn describe_other_topology_diff(
                     } else {
                         "turned off"
                     };
-                    diffs.push(format!("{name} {event}"));
+                    events.push((name.clone(), event));
                 }
             }
             (Some((name, p_avail, _)), None) if *p_avail => {
-                diffs.push(format!("{name} disconnected"));
+                events.push((name.clone(), "disconnected"));
             }
             (None, Some((name, c_avail, _))) if *c_avail => {
-                diffs.push(format!("{name} connected"));
+                events.push((name.clone(), "connected"));
             }
             _ => {}
         }
     }
-    diffs.join(", ")
+    events
+}
+
+fn describe_other_topology_diff(
+    prev_displays: &[DisplayInfo],
+    curr_displays: &[DisplayInfo],
+    disabled_keys: &[String],
+) -> String {
+    topology_diff_events(prev_displays, curr_displays, disabled_keys)
+        .into_iter()
+        .map(|(name, event)| format!("{name} {event}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn is_disconnect_or_off_hpd(
+    prev_displays: &[DisplayInfo],
+    curr_displays: &[DisplayInfo],
+    disabled_keys: &[String],
+) -> bool {
+    let events = topology_diff_events(prev_displays, curr_displays, disabled_keys);
+    !events.is_empty()
+        && events
+            .iter()
+            .all(|(_, ev)| *ev == "disconnected" || *ev == "turned off")
 }
 
 fn reconcile_disabled_keys(
@@ -2152,7 +2174,8 @@ fn worker_loop(
                 target_names,
                 trigger_vk,
                 lock_workstation,
-                fallback_dpms_on_access_denied,
+                session_locked,
+                allow_dpms_fallback_on_error5,
             } => {
                 let t = Instant::now();
                 let t_guard = Instant::now();
@@ -2181,9 +2204,9 @@ fn worker_loop(
                             result: DeactivateResult::WouldDisableAll,
                             ..
                         }) => {
-                            if fallback_dpms_on_access_denied {
+                            if session_locked {
                                 logging::info(format!(
-                                    "Locked-session HPD left no other active display; putting displays into DPMS sleep [guard={guard_ms}ms; {target_names}]"
+                                    "Locked-session HPD left no other active display; putting displays into DPMS sleep once until unlock [guard={guard_ms}ms; {target_names}]"
                                 ));
                                 send_monitors_off_power(Some(hwnd_raw));
                                 WorkerResult::SelectiveLockedDpmsFallback
@@ -2233,11 +2256,17 @@ fn worker_loop(
                         }) => WorkerResult::Failed(
                             "No active display matched the requested selection".into(),
                         ),
-                        Err(e) if fallback_dpms_on_access_denied && e.contains("error 5") => {
-                            logging::info(format!(
-                                "Windows blocked selective CCD re-disable while session locked (error 5) [guard={guard_ms}ms]; putting displays into DPMS sleep [{target_names}]"
-                            ));
-                            send_monitors_off_power(Some(hwnd_raw));
+                        Err(e) if session_locked && e.contains("error 5") => {
+                            if allow_dpms_fallback_on_error5 {
+                                logging::info(format!(
+                                    "Windows blocked selective CCD re-disable while session locked (error 5) [guard={guard_ms}ms]; putting displays into DPMS sleep once until unlock [{target_names}]"
+                                ));
+                                send_monitors_off_power(Some(hwnd_raw));
+                            } else {
+                                logging::info(format!(
+                                    "Windows blocked selective CCD re-disable while session locked (error 5) [guard={guard_ms}ms]; deferring until session unlock so lock screen stays visible [{target_names}]"
+                                ));
+                            }
                             WorkerResult::SelectiveLockedDpmsFallback
                         }
                         Err(e) => WorkerResult::Failed(format!("DeactivateSelective failed: {e}")),
@@ -3029,5 +3058,47 @@ mod tests {
             plan_selective_display_change(&curr, &disabled, true, false, 0, true, true),
             SelectiveChangeAction::ReDeactivate(vec!["display#len8aa5#4".into()])
         );
+    }
+
+    #[test]
+    fn disconnect_vs_connect_hpd_controls_locked_dpms_fallback() {
+        let disabled = vec![
+            "display#len8aa5#4".to_string(),
+            "display#aus1641#3".to_string(),
+        ];
+        let j560_on = make_disp("display#boe2775#1", "J560T09", DisplayRole::External, true);
+        let p27_on = make_disp("display#len61e9#2", "P27h-20", DisplayRole::External, true);
+        let p27_off = make_disp("display#len61e9#2", "P27h-20", DisplayRole::External, false);
+        let internal_off = make_disp(
+            "display#len8aa5#4",
+            "Internal Display",
+            DisplayRole::Internal,
+            false,
+        );
+        let internal_on = make_disp(
+            "display#len8aa5#4",
+            "Internal Display",
+            DisplayRole::Internal,
+            true,
+        );
+
+        // Disconnecting P27h-20 while Internal Display reactivates -> disconnect HPD (DPMS fallback allowed once on error 5).
+        assert!(is_disconnect_or_off_hpd(
+            &[j560_on.clone(), p27_on.clone(), internal_off.clone()],
+            &[j560_on.clone(), internal_on.clone()],
+            &disabled,
+        ));
+
+        // Turning P27h-20 back on / connecting it while Internal Display reactivates -> connect HPD (must keep lock screen visible on error 5).
+        assert!(!is_disconnect_or_off_hpd(
+            &[j560_on.clone(), p27_off, internal_off.clone()],
+            &[j560_on.clone(), p27_on.clone(), internal_on.clone()],
+            &disabled,
+        ));
+        assert!(!is_disconnect_or_off_hpd(
+            &[j560_on.clone(), internal_off],
+            &[j560_on, p27_on, internal_on],
+            &disabled,
+        ));
     }
 }
